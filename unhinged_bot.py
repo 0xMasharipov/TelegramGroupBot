@@ -37,6 +37,7 @@ CHAOS_CHANCE  = 0.06           # ~6% chance to butt into a random message
 HISTORY_LEN   = 12             # messages of context kept per chat
 MAX_TOKENS    = 220            # keep replies punchy
 TEMPERATURE   = 1.0
+WAKE_WORDS    = ["gooner"]     # bot wakes up when any of these appears in a message
 
 # /russianroulette settings
 MUTE_ON_DEATH = True           # mute the loser (needs the bot to be admin)
@@ -144,14 +145,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history[chat_id].append({"role": "user", "content": f"{name}: {msg.text}"})
 
     bot_username = (context.bot.username or "").lower()
-    mentioned = f"@{bot_username}" in msg.text.lower()
+    text_lower = msg.text.lower()
+    mentioned = f"@{bot_username}" in text_lower
+    woke = any(w in text_lower for w in WAKE_WORDS)
     replied_to_me = bool(
         msg.reply_to_message
         and msg.reply_to_message.from_user
         and msg.reply_to_message.from_user.id == context.bot.id
     )
 
-    if not (mentioned or replied_to_me or random.random() < CHAOS_CHANCE):
+    if not (mentioned or woke or replied_to_me or random.random() < CHAOS_CHANCE):
         return
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
