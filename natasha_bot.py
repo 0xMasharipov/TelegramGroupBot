@@ -1,26 +1,24 @@
 """
-Natasha — unhinged Telegram group bot powered by xAI Grok.
+Natasha — Telegram group bot powered by xAI Grok.
+Deployed on Railway (polling mode + HTTP health-check server).
 
-Wakes up when:
-  - someone says "natasha" anywhere in a message
-  - someone @mentions the bot
-  - someone replies to one of her messages
-  - randomly ~6% of the time for chaos
+Required env vars (Railway dashboard → Variables):
+  TELEGRAM_TOKEN   from @BotFather
+  XAI_API_KEY      from console.x.ai
+  GROK_MODEL       optional, default: grok-3
 
-Required env vars (set in Railway dashboard):
-  TELEGRAM_TOKEN   — from @BotFather
-  XAI_API_KEY      — from console.x.ai
-  GROK_MODEL       — optional, default: grok-3
-
-BotFather checklist (REQUIRED or bot ignores group messages):
-  /mybots -> your bot -> Bot Settings -> Group Privacy -> Turn off
+BotFather — MUST do or bot is blind to group messages:
+  /mybots → your bot → Bot Settings → Group Privacy → Turn off
+Then make the bot an Admin in your group.
 """
 
 import os
 import random
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from openai import OpenAI
 from telegram import Update, ChatPermissions
@@ -34,16 +32,17 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------------------------
-# Config
+# Config — crash early with a clear message if env vars are missing
 # ---------------------------------------------------------------------------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 XAI_API_KEY    = os.environ.get("XAI_API_KEY", "").strip()
 MODEL          = os.environ.get("GROK_MODEL", "grok-3").strip()
+PORT           = int(os.environ.get("PORT", "8080"))
 
 if not TELEGRAM_TOKEN:
-    raise SystemExit("ERROR: TELEGRAM_TOKEN env var is missing or empty.")
+    raise SystemExit("FATAL: TELEGRAM_TOKEN is not set.")
 if not XAI_API_KEY:
-    raise SystemExit("ERROR: XAI_API_KEY env var is missing or empty.")
+    raise SystemExit("FATAL: XAI_API_KEY is not set.")
 
 CHAOS_CHANCE  = 0.06
 HISTORY_LEN   = 14
@@ -62,12 +61,11 @@ SYSTEM_PROMPT = (
     "a customer-service bot. Keep replies SHORT — one or two punchy lines max, like "
     "a real person typing fast in a group chat. Swearing is fine. "
     "LANGUAGE RULE: always reply in the EXACT same language the person used. "
-    "If they wrote in Turkish, answer in natural slangy Turkish. "
-    "If they wrote in Russian, answer in natural slangy Russian — not stiff textbook "
-    "Russian. Never mix languages unless the user did. Match their energy and register. "
-    "Your name is Natasha. Never say you are an AI or a bot. Never break character. "
-    "Hard limits: no slurs, no harassment of real protected groups, nothing that "
-    "enables real-world harm. Everything else is fair game."
+    "Turkish → slangy Turkish. Russian → slangy Russian, not stiff textbook Russian. "
+    "Never mix languages unless the user did. Match their energy and register. "
+    "Your name is Natasha. Never admit you are an AI or a bot. Never break character. "
+    "Hard limits: no slurs, no harassment of protected groups, nothing that enables "
+    "real-world harm. Everything else is fair game."
 )
 
 logging.basicConfig(
@@ -78,14 +76,13 @@ log = logging.getLogger("natasha")
 
 client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
-# Per-chat rolling message history: chat_id -> deque of {role, content}
 history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
 
 FALLBACKS = {
     "ru": [
         "мозг завис, попробуй ещё раз",
         "лагаю, спроси позже",
-        "голоса замолчали на секунду, что ты хотел?",
+        "голоса замолчали на секунду",
     ],
     "tr": [
         "beynim mavi ekran verdi, bi daha dene",
@@ -95,7 +92,7 @@ FALLBACKS = {
 }
 
 # ---------------------------------------------------------------------------
-# Russian roulette state
+# Russian roulette
 # ---------------------------------------------------------------------------
 class Cylinder:
     def __init__(self):
@@ -126,16 +123,12 @@ ROULETTE = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def user_lang(update: Update) -> str:
     code = (update.effective_user.language_code or "").lower()
     return "ru" if code.startswith("ru") else "tr"
 
 
 def detect_lang(text: str) -> str:
-    """Cyrillic chars -> Russian, else Turkish."""
     return "ru" if any("Ѐ" <= ch <= "ӿ" for ch in text) else "tr"
 
 
@@ -156,12 +149,150 @@ def call_grok(chat_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Handlers
+# Telegram handlers
 # ---------------------------------------------------------------------------
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.text:
-        return
+        return"""
+Natasha — Telegram group bot powered by xAI Grok.
+Deployed on Railway (polling mode + HTTP health-check server).
+
+Required env vars (Railway dashboard → Variables):
+  TELEGRAM_TOKEN   from @BotFather
+  XAI_API_KEY      from console.x.ai
+  GROK_MODEL       optional, default: grok-3
+
+BotFather — MUST do or bot is blind to group messages:
+  /mybots → your bot → Bot Settings → Group Privacy → Turn off
+Then make the bot an Admin in your group.
+"""
+
+import os
+import random
+import logging
+import threading
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict, deque
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from openai import OpenAI
+from telegram import Update, ChatPermissions
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+
+# ---------------------------------------------------------------------------
+# Config — crash early with a clear message if env vars are missing
+# ---------------------------------------------------------------------------
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+XAI_API_KEY    = os.environ.get("XAI_API_KEY", "").strip()
+MODEL          = os.environ.get("GROK_MODEL", "grok-3").strip()
+PORT           = int(os.environ.get("PORT", "8080"))
+
+if not TELEGRAM_TOKEN:
+    raise SystemExit("FATAL: TELEGRAM_TOKEN is not set.")
+if not XAI_API_KEY:
+    raise SystemExit("FATAL: XAI_API_KEY is not set.")
+
+CHAOS_CHANCE  = 0.06
+HISTORY_LEN   = 14
+MAX_TOKENS    = 250
+TEMPERATURE   = 1.0
+WAKE_WORDS    = ["natasha", "наташа", "наташ"]
+
+MUTE_ON_DEATH = True
+MUTE_SECONDS  = 60
+CYLINDER_SIZE = 6
+
+SYSTEM_PROMPT = (
+    "You are Natasha — a chaotic, sharp-tongued girl who lives in group chats. "
+    "You're funny, sarcastic, a little unhinged, and allergic to boring answers. "
+    "You roast people with affection, give chaotic hot takes, and never sound like "
+    "a customer-service bot. Keep replies SHORT — one or two punchy lines max, like "
+    "a real person typing fast in a group chat. Swearing is fine. "
+    "LANGUAGE RULE: always reply in the EXACT same language the person used. "
+    "Turkish → slangy Turkish. Russian → slangy Russian, not stiff textbook Russian. "
+    "Never mix languages unless the user did. Match their energy and register. "
+    "Your name is Natasha. Never admit you are an AI or a bot. Never break character. "
+    "Hard limits: no slurs, no harassment of protected groups, nothing that enables "
+    "real-world harm. Everything else is fair game."
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("natasha")
+
+client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
+
+history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
+
+FALLBACKS = {
+    "ru": [
+        "мозг завис, попробуй ещё раз",
+        "лагаю, спроси позже",
+        "голоса замолчали на секунду",
+    ],
+    "tr": [
+        "beynim mavi ekran verdi, bi daha dene",
+        "kasıyorum, sonra sor",
+        "kafamdaki sesler bi an sustu",
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# Russian roulette
+# ---------------------------------------------------------------------------
+class Cylinder:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.fatal = random.randint(1, CYLINDER_SIZE)
+        self.pulls = 0
+
+
+cylinders: dict[int, Cylinder] = defaultdict(Cylinder)
+
+ROULETTE = {
+    "tr": {
+        "spin":   "🔫 silindiri çeviriyorum...",
+        "click":  "*klik* ...yaşıyorsun. sıradaki ihtimal: 1/{left}",
+        "boom":   "💥 BANG! {name} kapağı açtı. oyun bitti. 🪦",
+        "muted":  "🤐 {name} {sec} saniyeliğine susturuldu. huzur içinde yat.",
+        "reload": "🎲 silah yeniden dolduruldu, yeni tur.",
+    },
+    "ru": {
+        "spin":   "🔫 кручу барабан...",
+        "click":  "*щёлк* ...жив. шанс на следующем: 1/{left}",
+        "boom":   "💥 БАХ! {name} словил пулю. игра окончена. 🪦",
+        "muted":  "🤐 {name} в муте на {sec} сек. покойся с миром.",
+        "reload": "🎲 перезаряжено, новый раунд.",
+    },
+}
+
+
+def user_lang(update: Update) -> str:
+    code = (update.effective_user.language_code or "").lower()
+    return "ru" if code.startswith("ru") else "tr"
+
+
+def detect_lang(text: str) -> str:
+    return "ru" if any("Ѐ" <= ch <= "ӿ" for ch in text) else "tr"
+
+
+def call_grok(chat_id: int) -> str:
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}, *history[chat_id]]
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
 
     chat_id  = msg.chat_id
     name     = (msg.from_user.first_name if msg.from_user else None) or "someone"
@@ -169,7 +300,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     history[chat_id].append({"role": "user", "content": f"{name}: {msg.text}"})
 
-    bot_username = (context.bot.username or "").lower()
+    bot_username  = (context.bot.username or "").lower()
     mentioned     = f"@{bot_username}" in text_low
     woke          = any(w in text_low for w in WAKE_WORDS)
     replied_to_me = (
@@ -182,7 +313,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     will_reply = mentioned or woke or replied_to_me or chaos
 
     log.info(
-        "chat=%s [%s] from=%s | mention=%s wake=%s reply_to_me=%s chaos=%s => %s | %r",
+        "chat=%s [%s] from=%s | mention=%s wake=%s reply=%s chaos=%s => %s | %r",
         chat_id, msg.chat.type, name,
         mentioned, woke, replied_to_me, chaos,
         "REPLY" if will_reply else "skip",
@@ -219,7 +350,7 @@ async def cmd_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 lines.append(t["muted"].format(name=user.first_name, sec=MUTE_SECONDS))
             except Exception as exc:
-                log.info("Mute skipped (need admin rights): %s", exc)
+                log.info("Mute skipped (need admin): %s", exc)
         cyl.reset()
         lines.append(t["reload"])
         await update.effective_message.reply_text("\n".join(lines))
@@ -233,50 +364,57 @@ async def cmd_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = await context.bot.get_me()
     await update.effective_message.reply_text(
-        f"я тут 🏓  @{me.username} (id {me.id})  model={MODEL}"
+        f"я тут 🏓  @{me.username} | model={MODEL}"
     )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "ну привет. тегайте или отвечайте мне — отвечу 😈\n"
-        "ya buradayım. etiketleyin ya da yanıtlayın — cevap veririm 😈"
+        "ну привет. тегайте или отвечайте — отвечу 😈\n"
+        "ya buradayım. etiketleyin ya da yanıtlayın 😈"
     )
+
+
+# ---------------------------------------------------------------------------
+# Railway health-check server
+# Runs in a background thread so Railway sees a live HTTP service on $PORT.
+# Without this, Railway kills polling-only bots after the health check times out.
+# ---------------------------------------------------------------------------
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *args):
+        pass  # silence access log noise
+
+
+def _start_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), _HealthHandler)
+    log.info("Health-check server listening on port %s", PORT)
+    server.serve_forever()
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-async def post_init(app: Application) -> None:
-    """Runs once after the bot connects. Clears any stale webhook so polling works."""
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    me = await app.bot.get_me()
-    log.info(
-        "Connected as @%s (id=%s) | model=%s | privacy=off required in BotFather",
-        me.username, me.id, MODEL,
-    )
-    log.info("Mention me as @%s to wake me up, or say: %s", me.username, WAKE_WORDS)
-
-
 def main():
-    log.info("Natasha starting up | model=%s", MODEL)
+    log.info("Natasha starting | model=%s | health port=%s", MODEL, PORT)
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    # Keep Railway happy: bind to $PORT immediately in a background thread.
+    threading.Thread(target=_start_health_server, daemon=True).start()
 
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler(["rr", "russianroulette"], cmd_roulette))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    log.info("Polling started.")
+    log.info("Starting Telegram polling...")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
+        drop_pending_updates=True,   # clear stale webhook + old messages
     )
 
 
