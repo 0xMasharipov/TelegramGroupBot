@@ -11,7 +11,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 XAI_API_KEY    = os.environ["XAI_API_KEY"]
 PORT           = int(os.environ.get("PORT", 8080))
-DOMAIN         = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+DOMAIN         = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "telegramgroupbot-production.up.railway.app").strip()
 
 MODEL   = "grok-4.3"
 XAI_URL = "https://api.x.ai/v1/responses"
@@ -151,6 +151,5 @@ def main():
     app.add_handler(CommandHandler(["rr", "russianroulette"], cmd_roulette))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    if DOMAIN:
-        webhook_url = f"https://{DOMAIN}/"
-        log.info("Webhook mode → %s", webhook_url)
+    webhook_url = f"https://{DOMAIN}/"
+    log.info("Webhook mode → %s (port %s)", webhook_url, PORT)
