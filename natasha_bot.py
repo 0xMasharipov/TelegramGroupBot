@@ -1,17 +1,58 @@
-import os, random, logging
+import os, random, logging, threading
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# ── PORT is the only thing read before the HTTP server starts ──────────────
+PORT = int(os.environ.get("PORT", 8080))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("natasha")
+
+# ── Start HTTP server on PORT immediately ──────────────────────────────────
+# Must happen before ANYTHING else so Railway never sees a 502.
+# Daemon=True means it lives as long as the main thread lives.
+_STATUS = {"msg": "starting"}
+
+class _H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = _STATUS["msg"].encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+
+threading.Thread(
+    target=lambda: HTTPServer(("0.0.0.0", PORT), _H).serve_forever(),
+    daemon=True,
+).start()
+log.info("HTTP server up on port %s", PORT)
+
+# ── Read env vars — server is already up so any crash here won't 502 ───────
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+XAI_API_KEY    = os.environ.get("XAI_API_KEY", "").strip()
+
+if not TELEGRAM_TOKEN:
+    _STATUS["msg"] = "ERROR: TELEGRAM_TOKEN env var not set"
+    log.error(_STATUS["msg"])
+
+if not XAI_API_KEY:
+    _STATUS["msg"] = "ERROR: XAI_API_KEY env var not set"
+    log.error(_STATUS["msg"])
+
+if not TELEGRAM_TOKEN or not XAI_API_KEY:
+    # Block main thread forever — keeps daemon HTTP server alive
+    # so you can curl the URL and read the error
+    threading.Event().wait()
+
+# ── Heavy imports after env check ──────────────────────────────────────────
 import httpx
 from telegram import Update, ChatPermissions
 from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
-# --- config ---
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-XAI_API_KEY    = os.environ["XAI_API_KEY"]
-PORT           = int(os.environ.get("PORT", 8080))
-DOMAIN         = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "telegramgroupbot-production.up.railway.app").strip()
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, ContextTypes,
+)
 
 MODEL   = "grok-4.3"
 XAI_URL = "https://api.x.ai/v1/responses"
@@ -30,24 +71,20 @@ SYSTEM_PROMPT = (
     "Russian → slangy Russian. Your name is Natasha. Never admit being an AI."
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("natasha")
-
 history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
 
-# --- roulette ---
 class Cylinder:
     def __init__(self): self.reset()
     def reset(self): self.fatal = random.randint(1, CYLINDER_SIZE); self.pulls = 0
 
 cylinders: dict[int, Cylinder] = defaultdict(Cylinder)
 
-# --- xAI ---
 def call_grok(chat_id: int) -> str:
     try:
         r = httpx.post(
             XAI_URL,
-            headers={"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {XAI_API_KEY}",
+                     "Content-Type": "application/json"},
             json={
                 "model": MODEL,
                 "instructions": SYSTEM_PROMPT,
@@ -63,14 +100,13 @@ def call_grok(chat_id: int) -> str:
                 for block in item.get("content", []):
                     if block.get("type") == "output_text":
                         return block["text"].strip()
-        log.error("No output_text in response: %s", r.text[:300])
+        log.error("No output_text: %s", r.text[:300])
         return "..."
     except Exception as e:
         log.error("xAI error: %s", e)
         last = history[chat_id][-1]["content"] if history[chat_id] else ""
-        return "мозг завис" if any("Ѐ" <= c <= "ӿ" for c in last) else "beynim mavi ekran"
+        return "мозг завис" if any("Ѐ" <= c <= "ӿ" for c in last) else "beynim crash etti"
 
-# --- handlers ---
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.text:
@@ -99,7 +135,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history[chat_id].append({"role": "assistant", "content": reply})
     await msg.reply_text(reply)
 
-
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"pong 🏓 model={MODEL}")
 
@@ -107,13 +142,15 @@ async def cmd_testapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     try:
         r = httpx.post(XAI_URL,
-            headers={"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": MODEL, "input": "say: API OK", "reasoning": {"effort": "low"}},
-            timeout=30)
+            headers={"Authorization": f"Bearer {XAI_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"model": MODEL, "input": "say: API OK",
+                  "reasoning": {"effort": "low"}}, timeout=30)
         r.raise_for_status()
-        text = next(
-            (b["text"] for item in r.json().get("output", []) if item.get("type") == "message"
-             for b in item.get("content", []) if b.get("type") == "output_text"), "no text")
+        text = next((b["text"] for item in r.json().get("output", [])
+                     if item.get("type") == "message"
+                     for b in item.get("content", [])
+                     if b.get("type") == "output_text"), "no text")
         await update.effective_message.reply_text(f"✅ xAI OK | {MODEL}\n{text}")
     except Exception as e:
         await update.effective_message.reply_text(f"❌ xAI error:\n{e}")
@@ -140,9 +177,9 @@ async def cmd_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("ну привет 😈  ya buradayım 😈")
 
-# --- main ---
 def main():
-    log.info("=== Natasha starting | model=%s | port=%s | domain=%s ===", MODEL, PORT, DOMAIN or "none")
+    _STATUS["msg"] = f"ok | model={MODEL}"
+    log.info("=== Starting Telegram polling | model=%s ===", MODEL)
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("ping",    cmd_ping))
@@ -151,5 +188,10 @@ def main():
     app.add_handler(CommandHandler(["rr", "russianroulette"], cmd_roulette))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    webhook_url = f"https://{DOMAIN}/"
-    log.info("Webhook mode → %s (port %s)", webhook_url, PORT)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+    )
+
+if __name__ == "__main__":
+    main()
