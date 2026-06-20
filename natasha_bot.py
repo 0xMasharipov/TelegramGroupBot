@@ -1,9 +1,11 @@
 """
-Natasha — Telegram group bot powered by xAI grok-4.3 (Responses API).
+Natasha — Telegram group bot powered by xAI grok-4.3.
+Uses WEBHOOK mode (not polling) — required for reliable Railway deployment.
 
 Required env vars (Railway dashboard → Variables):
-  TELEGRAM_TOKEN   from @BotFather
-  XAI_API_KEY      from console.x.ai
+  TELEGRAM_TOKEN          from @BotFather
+  XAI_API_KEY             from console.x.ai
+  RAILWAY_PUBLIC_DOMAIN   set automatically by Railway (e.g. myapp.up.railway.app)
 
 BotFather — MUST do or bot is blind to group messages:
   /mybots → your bot → Bot Settings → Group Privacy → Turn off
@@ -13,10 +15,8 @@ Then make the bot an Admin in your group.
 import os
 import random
 import logging
-import threading
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 from telegram import Update, ChatPermissions
@@ -32,9 +32,10 @@ from telegram.ext import (
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-XAI_API_KEY    = os.environ.get("XAI_API_KEY", "").strip()
-PORT           = int(os.environ.get("PORT", "8080"))
+TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "").strip()
+XAI_API_KEY     = os.environ.get("XAI_API_KEY", "").strip()
+PORT            = int(os.environ.get("PORT", "8080"))
+RAILWAY_DOMAIN  = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
 
 if not TELEGRAM_TOKEN:
     raise SystemExit("FATAL: TELEGRAM_TOKEN is not set.")
@@ -83,33 +84,6 @@ FALLBACKS = {
     "ru": ["мозг завис, попробуй ещё раз", "лагаю, спроси позже"],
     "tr": ["beynim mavi ekran verdi, bi daha dene", "kasıyorum, sonra sor"],
 }
-
-# ---------------------------------------------------------------------------
-# Startup checks (synchronous, run before any async code)
-# ---------------------------------------------------------------------------
-def verify_bot_token():
-    """Confirm TELEGRAM_TOKEN is valid. Crashes loudly if not."""
-    r = httpx.get(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe",
-        timeout=10,
-    )
-    data = r.json()
-    if not data.get("ok"):
-        raise SystemExit(f"FATAL: Telegram token invalid → {data}")
-    me = data["result"]
-    log.info("✅ Token OK — bot is @%s (id=%s)", me["username"], me["id"])
-    return me
-
-
-def clear_webhook():
-    """Delete any registered webhook so long-polling can receive updates."""
-    r = httpx.post(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook",
-        json={"drop_pending_updates": True},
-        timeout=10,
-    )
-    log.info("🔧 deleteWebhook → %s", r.json())
-
 
 # ---------------------------------------------------------------------------
 # Russian roulette
@@ -177,7 +151,7 @@ def call_grok(chat_id: int) -> str:
         r.raise_for_status()
         text = _extract_text(r.json())
         if not text:
-            log.error("Empty text in API response: %s", r.text[:300])
+            log.error("Empty API response body: %s", r.text[:300])
             raise ValueError("empty response")
         return text
     except Exception as exc:
@@ -237,7 +211,7 @@ async def cmd_testapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             headers=XAI_HEADERS,
             json={
                 "model":     MODEL,
-                "input":     "Reply with exactly the words: API OK",
+                "input":     "Reply with exactly: API OK",
                 "reasoning": {"effort": "low"},
             },
             timeout=30.0,
@@ -298,34 +272,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Railway health-check HTTP server (background thread)
-# ---------------------------------------------------------------------------
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
-
-    def log_message(self, *args):
-        pass
-
-
-def _start_health_server():
-    HTTPServer(("0.0.0.0", PORT), _HealthHandler).serve_forever()
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    log.info("=== Natasha bot starting ===")
-
-    # These run synchronously before any async code — failures are fatal & visible in logs
-    verify_bot_token()
-    clear_webhook()
-
-    threading.Thread(target=_start_health_server, daemon=True).start()
-    log.info("Health server started on port %s", PORT)
+    log.info("=== Natasha starting | model=%s | port=%s ===", MODEL, PORT)
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",   cmd_start))
@@ -334,11 +284,23 @@ def main():
     app.add_handler(CommandHandler(["rr", "russianroulette"], cmd_roulette))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    log.info("=== Polling started — bot is live ===")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    if RAILWAY_DOMAIN:
+        webhook_url = f"https://{RAILWAY_DOMAIN}/webhook"
+        log.info("Webhook mode → %s", webhook_url)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="/webhook",
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        log.info("RAILWAY_PUBLIC_DOMAIN not set — using polling mode")
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
 
 
 if __name__ == "__main__":
