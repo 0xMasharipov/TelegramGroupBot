@@ -38,7 +38,7 @@ CHAOS_CHANCE  = 0.06           # ~6% chance to butt into a random message
 HISTORY_LEN   = 12             # messages of context kept per chat
 MAX_TOKENS    = 220            # keep replies punchy
 TEMPERATURE   = 1.0
-WAKE_WORDS    = ["gooner"]     # bot wakes up when any of these appears in a message
+WAKE_WORDS    = ["@GoonerDestroyeBot"]     # bot wakes up when any of these appears in a message
 
 # /russianroulette settings
 MUTE_ON_DEATH = True           # mute the loser (needs the bot to be admin)
