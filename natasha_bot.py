@@ -8,10 +8,6 @@ Required env vars (Railway dashboard → Variables):
 BotFather — MUST do or bot is blind to group messages:
   /mybots → your bot → Bot Settings → Group Privacy → Turn off
 Then make the bot an Admin in your group.
-
-Debug commands:
-  /ping     — confirm bot is alive
-  /testapi  — test xAI connection
 """
 
 import os
@@ -45,9 +41,9 @@ if not TELEGRAM_TOKEN:
 if not XAI_API_KEY:
     raise SystemExit("FATAL: XAI_API_KEY is not set.")
 
-MODEL         = "grok-4.3"
-XAI_URL       = "https://api.x.ai/v1/responses"
-XAI_HEADERS   = {
+MODEL       = "grok-4.3"
+XAI_URL     = "https://api.x.ai/v1/responses"
+XAI_HEADERS = {
     "Content-Type":  "application/json",
     "Authorization": f"Bearer {XAI_API_KEY}",
 }
@@ -81,13 +77,39 @@ logging.basicConfig(
 )
 log = logging.getLogger("natasha")
 
-# Per-chat message history  {chat_id: deque of {"role": ..., "content": ...}}
 history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
 
 FALLBACKS = {
     "ru": ["мозг завис, попробуй ещё раз", "лагаю, спроси позже"],
     "tr": ["beynim mavi ekran verdi, bi daha dene", "kasıyorum, sonra sor"],
 }
+
+# ---------------------------------------------------------------------------
+# Startup checks (synchronous, run before any async code)
+# ---------------------------------------------------------------------------
+def verify_bot_token():
+    """Confirm TELEGRAM_TOKEN is valid. Crashes loudly if not."""
+    r = httpx.get(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe",
+        timeout=10,
+    )
+    data = r.json()
+    if not data.get("ok"):
+        raise SystemExit(f"FATAL: Telegram token invalid → {data}")
+    me = data["result"]
+    log.info("✅ Token OK — bot is @%s (id=%s)", me["username"], me["id"])
+    return me
+
+
+def clear_webhook():
+    """Delete any registered webhook so long-polling can receive updates."""
+    r = httpx.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook",
+        json={"drop_pending_updates": True},
+        timeout=10,
+    )
+    log.info("🔧 deleteWebhook → %s", r.json())
+
 
 # ---------------------------------------------------------------------------
 # Russian roulette
@@ -134,7 +156,6 @@ def detect_lang(text: str) -> str:
 # xAI Responses API
 # ---------------------------------------------------------------------------
 def _extract_text(data: dict) -> str:
-    """Pull the assistant text out of a Responses API reply."""
     for item in data.get("output", []):
         if item.get("type") == "message":
             for block in item.get("content", []):
@@ -145,10 +166,10 @@ def _extract_text(data: dict) -> str:
 
 def call_grok(chat_id: int) -> str:
     payload = {
-        "model":        MODEL,
-        "instructions": SYSTEM_PROMPT,
-        "input":        list(history[chat_id]),
-        "reasoning":    {"effort": "low"},
+        "model":             MODEL,
+        "instructions":      SYSTEM_PROMPT,
+        "input":             list(history[chat_id]),
+        "reasoning":         {"effort": "low"},
         "max_output_tokens": MAX_TOKENS,
     }
     try:
@@ -156,7 +177,7 @@ def call_grok(chat_id: int) -> str:
         r.raise_for_status()
         text = _extract_text(r.json())
         if not text:
-            log.error("Empty text in response: %s", r.text[:300])
+            log.error("Empty text in API response: %s", r.text[:300])
             raise ValueError("empty response")
         return text
     except Exception as exc:
@@ -216,7 +237,7 @@ async def cmd_testapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             headers=XAI_HEADERS,
             json={
                 "model":     MODEL,
-                "input":     "Reply with exactly: API OK",
+                "input":     "Reply with exactly the words: API OK",
                 "reasoning": {"effort": "low"},
             },
             timeout=30.0,
@@ -224,12 +245,10 @@ async def cmd_testapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r.raise_for_status()
         text = _extract_text(r.json())
         await update.effective_message.reply_text(
-            f"✅ xAI API OK\nModel: {MODEL}\nResponse: {text}"
+            f"✅ xAI OK\nmodel: {MODEL}\nreply: {text}"
         )
     except Exception as exc:
-        await update.effective_message.reply_text(
-            f"❌ xAI API error:\n{exc}"
-        )
+        await update.effective_message.reply_text(f"❌ xAI error:\n{exc}")
 
 
 async def cmd_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -267,7 +286,7 @@ async def cmd_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = await context.bot.get_me()
     await update.effective_message.reply_text(
-        f"я тут 🏓  @{me.username} | model={MODEL}"
+        f"pong 🏓  @{me.username} | model={MODEL}"
     )
 
 
@@ -279,7 +298,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Railway health-check server
+# Railway health-check HTTP server (background thread)
 # ---------------------------------------------------------------------------
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -299,8 +318,14 @@ def _start_health_server():
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    log.info("Natasha starting | model=%s | port=%s", MODEL, PORT)
+    log.info("=== Natasha bot starting ===")
+
+    # These run synchronously before any async code — failures are fatal & visible in logs
+    verify_bot_token()
+    clear_webhook()
+
     threading.Thread(target=_start_health_server, daemon=True).start()
+    log.info("Health server started on port %s", PORT)
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",   cmd_start))
@@ -309,7 +334,7 @@ def main():
     app.add_handler(CommandHandler(["rr", "russianroulette"], cmd_roulette))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    log.info("Polling started.")
+    log.info("=== Polling started — bot is live ===")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
