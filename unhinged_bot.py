@@ -1,3 +1,4 @@
+
 """
 Unhinged Telegram group bot powered by the xAI Grok API.
 
@@ -32,7 +33,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 XAI_API_KEY    = os.environ["XAI_API_KEY"]
 
-MODEL         = "grok-4.2"     # xAI flagship; older slugs redirect here
+MODEL         = "grok-4.20"    # xAI model; reasoning + non-reasoning modes
 CHAOS_CHANCE  = 0.06           # ~6% chance to butt into a random message
 HISTORY_LEN   = 12             # messages of context kept per chat
 MAX_TOKENS    = 220            # keep replies punchy
@@ -154,7 +155,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         and msg.reply_to_message.from_user.id == context.bot.id
     )
 
-    if not (mentioned or woke or replied_to_me or random.random() < CHAOS_CHANCE):
+    will_reply = mentioned or woke or replied_to_me or random.random() < CHAOS_CHANCE
+    log.info("MSG chat=%s type=%s from=%s | mention=%s woke=%s reply=%s -> %s | text=%r",
+             chat_id, msg.chat.type, name, mentioned, woke, replied_to_me,
+             "REPLY" if will_reply else "skip", msg.text[:80])
+
+    if not will_reply:
         return
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
@@ -196,6 +202,13 @@ async def russian_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    me = await context.bot.get_me()
+    await update.effective_message.reply_text(
+        f"pong 🏓 alive as @{me.username} (id {me.id})"
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "harika, başında durulması gereken bir grup daha. tamam. beni etiketle ya da "
@@ -208,6 +221,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler(["russianroulette", "rr"], russian_roulette))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     log.info("Bot is live and feral.")
