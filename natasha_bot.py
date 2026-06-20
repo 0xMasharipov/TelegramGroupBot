@@ -68,6 +68,10 @@ SYSTEM_PROMPT = (
 
 history = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
 
+# username (lowercase, no @) -> user_id
+known_users: dict[str, int] = {}
+
+
 class Cylinder:
     def __init__(self):
         self.reset()
@@ -132,6 +136,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id  = msg.chat_id
     name     = (msg.from_user.first_name if msg.from_user else None) or "someone"
     text_low = msg.text.lower()
+
+    # Track username -> user_id so /dm can find them later
+    if msg.from_user and msg.from_user.username:
+        known_users[msg.from_user.username.lower()] = msg.from_user.id
+
     history[chat_id].append({"role": "user", "content": name + ": " + msg.text})
 
     bot_user      = (context.bot.username or "").lower()
@@ -181,6 +190,37 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = _grok_request(chat_id, extra_content=content)
     history[chat_id].append({"role": "assistant", "content": reply})
     await msg.reply_text(reply)
+
+
+async def cmd_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage: /dm @username your message here
+    Sends a DM to a user who has previously written in the group.
+    """
+    if not context.args or len(context.args) < 2:
+        await update.effective_message.reply_text(
+            "Usage: /dm @username your message here"
+        )
+        return
+
+    raw      = context.args[0].lstrip("@").lower()
+    text     = " ".join(context.args[1:])
+    user_id  = known_users.get(raw)
+
+    if not user_id:
+        await update.effective_message.reply_text(
+            "@" + raw + " has not written in this group yet — "
+            "I don't have their ID. They need to send at least one message first."
+        )
+        return
+
+    try:
+        await context.bot.send_message(chat_id=user_id, text=text)
+        await update.effective_message.reply_text("Sent to @" + raw + " ✅")
+    except Exception as e:
+        await update.effective_message.reply_text(
+            "Could not send to @" + raw + ":\n" + str(e)
+        )
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,6 +283,7 @@ def main():
     log.info("=== Natasha starting | model=%s | port=%s ===", MODEL, PORT)
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("dm",      cmd_dm))
     app.add_handler(CommandHandler("ping",    cmd_ping))
     app.add_handler(CommandHandler("testapi", cmd_testapi))
     app.add_handler(CommandHandler("start",   cmd_start))
