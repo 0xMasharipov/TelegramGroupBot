@@ -32,7 +32,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 XAI_API_KEY    = os.environ["XAI_API_KEY"]
 
-MODEL         = "grok-4.3"     # xAI flagship; older slugs redirect here
+MODEL         = "grok-4.2"     # xAI flagship; older slugs redirect here
 CHAOS_CHANCE  = 0.06           # ~6% chance to butt into a random message
 HISTORY_LEN   = 12             # messages of context kept per chat
 MAX_TOKENS    = 220            # keep replies punchy
