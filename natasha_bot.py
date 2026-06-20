@@ -1,198 +1,97 @@
-"""
-Natasha — Telegram group bot powered by xAI grok-4.3.
-Uses WEBHOOK mode (not polling) — required for reliable Railway deployment.
-
-Required env vars (Railway dashboard → Variables):
-  TELEGRAM_TOKEN          from @BotFather
-  XAI_API_KEY             from console.x.ai
-  RAILWAY_PUBLIC_DOMAIN   set automatically by Railway (e.g. myapp.up.railway.app)
-
-BotFather — MUST do or bot is blind to group messages:
-  /mybots → your bot → Bot Settings → Group Privacy → Turn off
-Then make the bot an Admin in your group.
-"""
-
-import os
-import random
-import logging
+import os, random, logging, threading
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 from telegram import Update, ChatPermissions
 from telegram.constants import ChatAction
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "").strip()
-XAI_API_KEY     = os.environ.get("XAI_API_KEY", "").strip()
-PORT            = int(os.environ.get("PORT", "8080"))
-RAILWAY_DOMAIN  = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+# --- env ---
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+XAI_API_KEY    = os.environ["XAI_API_KEY"]
+PORT           = int(os.environ.get("PORT", 8080))
 
-if not TELEGRAM_TOKEN:
-    raise SystemExit("FATAL: TELEGRAM_TOKEN is not set.")
-if not XAI_API_KEY:
-    raise SystemExit("FATAL: XAI_API_KEY is not set.")
+# --- xAI ---
+MODEL   = "grok-4.3"
+XAI_URL = "https://api.x.ai/v1/responses"
 
-MODEL       = "grok-4.3"
-XAI_URL     = "https://api.x.ai/v1/responses"
-XAI_HEADERS = {
-    "Content-Type":  "application/json",
-    "Authorization": f"Bearer {XAI_API_KEY}",
-}
-
-CHAOS_CHANCE  = 0.06
-HISTORY_LEN   = 14
-MAX_TOKENS    = 400
-WAKE_WORDS    = ["natasha", "наташа", "наташ"]
-
-MUTE_ON_DEATH = True
-MUTE_SECONDS  = 60
+# --- bot ---
+WAKE_WORDS   = ["natasha", "наташа", "наташ"]
+CHAOS_CHANCE = 0.06
+HISTORY_LEN  = 14
+MUTE_SECONDS = 60
 CYLINDER_SIZE = 6
 
 SYSTEM_PROMPT = (
     "You are Natasha — a chaotic, sharp-tongued girl who lives in group chats. "
-    "You're funny, sarcastic, a little unhinged, and allergic to boring answers. "
-    "You roast people with affection, give chaotic hot takes, and never sound like "
-    "a customer-service bot. Keep replies SHORT — one or two punchy lines max, like "
-    "a real person typing fast in a group chat. Swearing is fine. "
-    "LANGUAGE RULE: always reply in the EXACT same language the person used. "
-    "Turkish → slangy Turkish. Russian → slangy Russian, not stiff textbook Russian. "
-    "Never mix languages unless the user did. Match their energy and register. "
-    "Your name is Natasha. Never admit you are an AI or a bot. Never break character. "
-    "Hard limits: no slurs, no harassment of protected groups, nothing that enables "
-    "real-world harm. Everything else is fair game."
+    "Funny, sarcastic, unhinged. Roast people with affection. SHORT replies — one or "
+    "two punchy lines like a real person. Swearing fine. "
+    "ALWAYS reply in the same language the person used. Turkish → slangy Turkish. "
+    "Russian → slangy Russian. Your name is Natasha. Never admit being an AI."
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("natasha")
 
 history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
 
-FALLBACKS = {
-    "ru": ["мозг завис, попробуй ещё раз", "лагаю, спроси позже"],
-    "tr": ["beynim mavi ekran verdi, bi daha dene", "kasıyorum, sonra sor"],
-}
-
-# ---------------------------------------------------------------------------
-# Russian roulette
-# ---------------------------------------------------------------------------
+# --- Russian roulette ---
 class Cylinder:
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.fatal = random.randint(1, CYLINDER_SIZE)
-        self.pulls = 0
-
+    def __init__(self): self.reset()
+    def reset(self): self.fatal = random.randint(1, CYLINDER_SIZE); self.pulls = 0
 
 cylinders: dict[int, Cylinder] = defaultdict(Cylinder)
 
-ROULETTE = {
-    "tr": {
-        "spin":   "🔫 silindiri çeviriyorum...",
-        "click":  "*klik* ...yaşıyorsun. sıradaki ihtimal: 1/{left}",
-        "boom":   "💥 BANG! {name} kapağı açtı. oyun bitti. 🪦",
-        "muted":  "🤐 {name} {sec} saniyeliğine susturuldu. huzur içinde yat.",
-        "reload": "🎲 silah yeniden dolduruldu, yeni tur.",
-    },
-    "ru": {
-        "spin":   "🔫 кручу барабан...",
-        "click":  "*щёлк* ...жив. шанс на следующем: 1/{left}",
-        "boom":   "💥 БАХ! {name} словил пулю. игра окончена. 🪦",
-        "muted":  "🤐 {name} в муте на {sec} сек. покойся с миром.",
-        "reload": "🎲 перезаряжено, новый раунд.",
-    },
-}
-
-
-def user_lang(update: Update) -> str:
-    code = (update.effective_user.language_code or "").lower()
-    return "ru" if code.startswith("ru") else "tr"
-
-
-def detect_lang(text: str) -> str:
-    return "ru" if any("Ѐ" <= ch <= "ӿ" for ch in text) else "tr"
-
-
-# ---------------------------------------------------------------------------
-# xAI Responses API
-# ---------------------------------------------------------------------------
-def _extract_text(data: dict) -> str:
-    for item in data.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                if block.get("type") == "output_text":
-                    return block.get("text", "").strip()
-    return ""
-
-
+# --- xAI call ---
 def call_grok(chat_id: int) -> str:
-    payload = {
-        "model":             MODEL,
-        "instructions":      SYSTEM_PROMPT,
-        "input":             list(history[chat_id]),
-        "reasoning":         {"effort": "low"},
-        "max_output_tokens": MAX_TOKENS,
-    }
     try:
-        r = httpx.post(XAI_URL, headers=XAI_HEADERS, json=payload, timeout=30.0)
+        r = httpx.post(
+            XAI_URL,
+            headers={"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": MODEL,
+                "instructions": SYSTEM_PROMPT,
+                "input": list(history[chat_id]),
+                "reasoning": {"effort": "low"},
+                "max_output_tokens": 300,
+            },
+            timeout=30,
+        )
         r.raise_for_status()
-        text = _extract_text(r.json())
-        if not text:
-            log.error("Empty API response body: %s", r.text[:300])
-            raise ValueError("empty response")
-        return text
-    except Exception as exc:
-        log.error("Grok error: %s", exc)
-        last = history[chat_id][-1]["content"] if history[chat_id] else ""
-        return random.choice(FALLBACKS[detect_lang(last)])
+        for item in r.json().get("output", []):
+            if item.get("type") == "message":
+                for block in item.get("content", []):
+                    if block.get("type") == "output_text":
+                        return block["text"].strip()
+        log.error("No text in response: %s", r.text[:300])
+        return "..."
+    except Exception as e:
+        log.error("xAI error: %s", e)
+        return "мозг завис" if any("Ѐ" <= c <= "ӿ" for c in (history[chat_id][-1]["content"] if history[chat_id] else "")) else "beynim mavi ekran"
 
-
-# ---------------------------------------------------------------------------
-# Telegram handlers
-# ---------------------------------------------------------------------------
+# --- handlers ---
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.text:
         return
-
     chat_id  = msg.chat_id
     name     = (msg.from_user.first_name if msg.from_user else None) or "someone"
     text_low = msg.text.lower()
-
     history[chat_id].append({"role": "user", "content": f"{name}: {msg.text}"})
 
-    bot_username  = (context.bot.username or "").lower()
-    mentioned     = f"@{bot_username}" in text_low
+    bot_user      = (context.bot.username or "").lower()
+    mentioned     = f"@{bot_user}" in text_low
     woke          = any(w in text_low for w in WAKE_WORDS)
-    replied_to_me = (
-        msg.reply_to_message is not None
-        and msg.reply_to_message.from_user is not None
-        and msg.reply_to_message.from_user.id == context.bot.id
-    )
-    chaos = random.random() < CHAOS_CHANCE
+    replied_to_me = (msg.reply_to_message and msg.reply_to_message.from_user
+                     and msg.reply_to_message.from_user.id == context.bot.id)
+    chaos         = random.random() < CHAOS_CHANCE
+    will_reply    = mentioned or woke or replied_to_me or chaos
 
-    will_reply = mentioned or woke or replied_to_me or chaos
-
-    log.info(
-        "chat=%s [%s] from=%s | mention=%s wake=%s reply=%s chaos=%s => %s | %r",
-        chat_id, msg.chat.type, name,
-        mentioned, woke, replied_to_me, chaos,
-        "REPLY" if will_reply else "skip",
-        msg.text[:80],
-    )
+    log.info("chat=%s from=%s wake=%s mention=%s reply=%s chaos=%s => %s | %r",
+             chat_id, name, woke, mentioned, bool(replied_to_me), chaos,
+             "REPLY" if will_reply else "skip", msg.text[:60])
 
     if not will_reply:
         return
@@ -203,105 +102,78 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(reply)
 
 
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(f"pong 🏓 model={MODEL}")
+
+
 async def cmd_testapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     try:
-        r = httpx.post(
-            XAI_URL,
-            headers=XAI_HEADERS,
-            json={
-                "model":     MODEL,
-                "input":     "Reply with exactly: API OK",
-                "reasoning": {"effort": "low"},
-            },
-            timeout=30.0,
-        )
+        r = httpx.post(XAI_URL,
+            headers={"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": MODEL, "input": "say: API OK", "reasoning": {"effort": "low"}},
+            timeout=30)
         r.raise_for_status()
-        text = _extract_text(r.json())
-        await update.effective_message.reply_text(
-            f"✅ xAI OK\nmodel: {MODEL}\nreply: {text}"
-        )
-    except Exception as exc:
-        await update.effective_message.reply_text(f"❌ xAI error:\n{exc}")
+        text = ""
+        for item in r.json().get("output", []):
+            if item.get("type") == "message":
+                for b in item.get("content", []):
+                    if b.get("type") == "output_text":
+                        text = b["text"].strip()
+        await update.effective_message.reply_text(f"✅ xAI OK | model={MODEL}\n{text}")
+    except Exception as e:
+        await update.effective_message.reply_text(f"❌ xAI error:\n{e}")
 
 
 async def cmd_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-    t    = ROULETTE[user_lang(update)]
-    cyl  = cylinders[chat.id]
+    chat, user = update.effective_chat, update.effective_user
+    cyl = cylinders[chat.id]
     cyl.pulls += 1
-
-    await context.bot.send_chat_action(chat.id, ChatAction.TYPING)
-
     if cyl.pulls >= cyl.fatal:
-        lines = [t["spin"], t["boom"].format(name=user.first_name)]
-        if MUTE_ON_DEATH and chat.type in ("group", "supergroup"):
+        msg = f"💥 BANG! {user.first_name} is dead 🪦"
+        if chat.type in ("group", "supergroup"):
             try:
                 until = datetime.now(timezone.utc) + timedelta(seconds=MUTE_SECONDS)
                 await context.bot.restrict_chat_member(
                     chat.id, user.id,
                     permissions=ChatPermissions(can_send_messages=False),
-                    until_date=until,
-                )
-                lines.append(t["muted"].format(name=user.first_name, sec=MUTE_SECONDS))
-            except Exception as exc:
-                log.info("Mute skipped (need admin): %s", exc)
+                    until_date=until)
+                msg += f"\n🤐 muted {MUTE_SECONDS}s"
+            except Exception as e:
+                log.info("mute skipped: %s", e)
         cyl.reset()
-        lines.append(t["reload"])
-        await update.effective_message.reply_text("\n".join(lines))
+        await update.effective_message.reply_text(msg + "\n🎲 reloaded")
     else:
         left = CYLINDER_SIZE - cyl.pulls
-        await update.effective_message.reply_text(
-            t["spin"] + "\n" + t["click"].format(left=left)
-        )
-
-
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    me = await context.bot.get_me()
-    await update.effective_message.reply_text(
-        f"pong 🏓  @{me.username} | model={MODEL}"
-    )
+        await update.effective_message.reply_text(f"🔫 *click* ...alive. next odds: 1/{left}")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "ну привет. тегайте или отвечайте — отвечу 😈\n"
-        "ya buradayım. etiketleyin ya da yanıtlayın 😈"
-    )
+    await update.effective_message.reply_text("ну привет 😈  ya buradayım 😈")
 
+# --- health check server for Railway ---
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+    def log_message(self, *a): pass
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 def main():
-    log.info("=== Natasha starting | model=%s | port=%s ===", MODEL, PORT)
+    log.info("Starting Natasha | model=%s | port=%s", MODEL, PORT)
+
+    # Health server — keeps Railway from killing the process
+    threading.Thread(target=lambda: HTTPServer(("0.0.0.0", PORT), _Health).serve_forever(),
+                     daemon=True).start()
+    log.info("Health server up on port %s", PORT)
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("ping",    cmd_ping))
     app.add_handler(CommandHandler("testapi", cmd_testapi))
+    app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler(["rr", "russianroulette"], cmd_roulette))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    if RAILWAY_DOMAIN:
-        webhook_url = f"https://{RAILWAY_DOMAIN}/webhook"
-        log.info("Webhook mode → %s", webhook_url)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path="/webhook",
-            webhook_url=webhook_url,
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-        )
-    else:
-        log.info("RAILWAY_PUBLIC_DOMAIN not set — using polling mode")
-        app.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
-
+    log.info("Polling...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
