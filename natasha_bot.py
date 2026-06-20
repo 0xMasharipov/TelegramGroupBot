@@ -50,6 +50,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 MODEL   = "grok-4.3"
 XAI_URL = "https://api.x.ai/v1/responses"
 
+ADMIN_ID      = 1346274959
 WAKE_WORDS    = ["natasha", "наташа", "наташ"]
 CHAOS_CHANCE  = 0.06
 HISTORY_LEN   = 14
@@ -70,6 +71,9 @@ history = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
 
 # username (lowercase, no @) -> user_id
 known_users: dict[str, int] = {}
+
+# group chat_id -> group title
+known_groups: dict[int, str] = {}
 
 
 class Cylinder:
@@ -141,6 +145,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.from_user and msg.from_user.username:
         known_users[msg.from_user.username.lower()] = msg.from_user.id
 
+    # Track which groups the bot is active in
+    if msg.chat.type in ("group", "supergroup"):
+        known_groups[chat_id] = msg.chat.title or str(chat_id)
+
     history[chat_id].append({"role": "user", "content": name + ": " + msg.text})
 
     bot_user      = (context.bot.username or "").lower()
@@ -192,34 +200,100 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(reply)
 
 
-async def cmd_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _is_admin(update: Update) -> bool:
+    return update.effective_user is not None and update.effective_user.id == ADMIN_ID
+
+
+async def cmd_togroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Usage: /dm @username your message here
-    Sends a DM to a user who has previously written in the group.
+    Admin only. Usage:
+      /togroup mesajiniz          -> tek grup varsa oraya gonder
+      /togroup list               -> bilinen gruplari listele
+      /togroup <chat_id> mesaj    -> belirli gruba gonder
     """
-    if not context.args or len(context.args) < 2:
+    if not _is_admin(update):
+        await update.effective_message.reply_text("Bu komut sadece admin icin.")
+        return
+
+    if not context.args:
         await update.effective_message.reply_text(
-            "Usage: /dm @username your message here"
+            "Kullanim:\n"
+            "/togroup mesajiniz\n"
+            "/togroup list\n"
+            "/togroup <chat_id> mesajiniz"
         )
         return
 
-    raw      = context.args[0].lstrip("@").lower()
-    text     = " ".join(context.args[1:])
-    user_id  = known_users.get(raw)
+    # /togroup list
+    if context.args[0] == "list":
+        if not known_groups:
+            await update.effective_message.reply_text(
+                "Henuz hicbir grup bilmiyorum. Bot bir grupta mesaj gorduğunde kaydeder."
+            )
+        else:
+            lines = ["Bilinen gruplar:"]
+            for gid, title in known_groups.items():
+                lines.append(str(gid) + " — " + title)
+            await update.effective_message.reply_text("\n".join(lines))
+        return
+
+    # /togroup <chat_id> mesaj
+    if context.args[0].lstrip("-").isdigit() and len(context.args) >= 2:
+        target_id = int(context.args[0])
+        text      = " ".join(context.args[1:])
+    elif len(known_groups) == 1:
+        target_id = list(known_groups.keys())[0]
+        text      = " ".join(context.args)
+    elif len(known_groups) > 1:
+        lines = ["Birden fazla grup var, hangisini belirt:\n"]
+        for gid, title in known_groups.items():
+            lines.append(str(gid) + " — " + title)
+        lines.append("\nKullanim: /togroup <chat_id> mesajiniz")
+        await update.effective_message.reply_text("\n".join(lines))
+        return
+    else:
+        await update.effective_message.reply_text(
+            "Henuz hicbir grup bilmiyorum. Once bot bir grupta aktif olmali."
+        )
+        return
+
+    try:
+        await context.bot.send_message(chat_id=target_id, text=text)
+        title = known_groups.get(target_id, str(target_id))
+        await update.effective_message.reply_text("Gonderildi: " + title + " ✅")
+    except Exception as e:
+        await update.effective_message.reply_text("Gonderilemedi:\n" + str(e))
+
+
+async def cmd_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin only. Usage: /dm @username mesajiniz
+    """
+    if not _is_admin(update):
+        await update.effective_message.reply_text("Bu komut sadece admin icin.")
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.effective_message.reply_text("Kullanim: /dm @username mesajiniz")
+        return
+
+    raw     = context.args[0].lstrip("@").lower()
+    text    = " ".join(context.args[1:])
+    user_id = known_users.get(raw)
 
     if not user_id:
         await update.effective_message.reply_text(
-            "@" + raw + " has not written in this group yet — "
-            "I don't have their ID. They need to send at least one message first."
+            "@" + raw + " grupta hic mesaj atmadi, ID'sini bilmiyorum.\n"
+            "Once grupta bir mesaj atmasi gerekiyor."
         )
         return
 
     try:
         await context.bot.send_message(chat_id=user_id, text=text)
-        await update.effective_message.reply_text("Sent to @" + raw + " ✅")
+        await update.effective_message.reply_text("@" + raw + " adresine gonderildi ✅")
     except Exception as e:
         await update.effective_message.reply_text(
-            "Could not send to @" + raw + ":\n" + str(e)
+            "@" + raw + " adresine gonderilemedi:\n" + str(e)
         )
 
 
@@ -283,7 +357,8 @@ def main():
     log.info("=== Natasha starting | model=%s | port=%s ===", MODEL, PORT)
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("dm",      cmd_dm))
+    app.add_handler(CommandHandler("togroup",  cmd_togroup))
+    app.add_handler(CommandHandler("dm",       cmd_dm))
     app.add_handler(CommandHandler("ping",    cmd_ping))
     app.add_handler(CommandHandler("testapi", cmd_testapi))
     app.add_handler(CommandHandler("start",   cmd_start))
