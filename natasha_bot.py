@@ -59,6 +59,7 @@ OWNER_ID       = optional_int_env("OWNER_ID")  # set to enable owner-only comman
 
 # Optional media modules — each works only if its key is set (otherwise skipped).
 TENOR_API_KEY     = os.environ.get("TENOR_API_KEY", "")       # GIF/meme reactions (tenor.googleapis.com)
+PERSONA_UTC_OFFSET_HOURS = int(os.environ.get("PERSONA_UTC_OFFSET_HOURS", "3"))
 
 MODEL         = "grok-4.20"    # xAI model; reasoning + non-reasoning modes
 CHAOS_CHANCE  = 0.06           # ~6% chance to butt into a random message
@@ -67,6 +68,11 @@ MAX_TOKENS    = 160            # hard length cap — keeps replies texty, not es
 TEMPERATURE   = 1.0
 WAKE_WORDS    = ["gooner", "natasha", "наташа"]  # wakes when any appears in a message
 MAX_BUBBLES   = 3              # hard ceiling on bubbles; default behaviour is 1
+BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+PERSONA_IMAGES = {
+    "day": os.path.join(BASE_DIR, "assets", "natasha_persona_day.png"),
+    "night": os.path.join(BASE_DIR, "assets", "natasha_persona_night.png"),
+}
 
 # /russianroulette settings
 MUTE_ON_DEATH = True           # mute the loser (needs the bot to be admin)
@@ -484,6 +490,67 @@ def requested_media_from_user(text: str, default_lang: str, chat_id: int | None 
     return (spec if asks_meme else None), (spec if asks_sound else None)
 
 
+def wants_persona_photo(text: str) -> bool:
+    lowered = text.lower()
+    photo_words = (
+        "photo", "picture", "pic", "selfie", "avatar", "face", "look",
+        "foto", "fotoğraf", "fotograf", "resim", "avatarını", "fotoğrafını",
+        "fotografını", "resmini", "фото", "селфи", "аватар", "лицо",
+    )
+    action_words = (
+        "send", "show", "drop", "give", "at", "gönder", "yolla", "göstersene",
+        "goster", "göster", "скинь", "отправь", "покажи", "дай",
+    )
+    self_words = (
+        "your", "ur", "you", "natasha", "senin", "kendini", "kendi",
+        "сво", "тво", "наташа",
+    )
+    return (
+        any(word in lowered for word in photo_words)
+        and any(re.search(rf"\b{re.escape(word)}\b", lowered) for word in action_words)
+        and any(word in lowered for word in self_words)
+    )
+
+
+def persona_period():
+    local = datetime.now(timezone.utc) + timedelta(hours=PERSONA_UTC_OFFSET_HOURS)
+    return "day" if 7 <= local.hour < 19 else "night"
+
+
+def persona_caption(lang: str, period: str):
+    captions = {
+        "tr": {
+            "day": "gündüz modu. fazla bakma kanka",
+            "night": "gece modu. sorun çıkaracak gibi duruyorum",
+        },
+        "ru": {
+            "day": "дневной режим. не привыкай",
+            "night": "ночной режим. выгляжу как проблема",
+        },
+        "en": {
+            "day": "day mode. don't stare too hard",
+            "night": "night mode. absolute bad idea energy",
+        },
+    }
+    return captions.get(lang, captions["en"])[period]
+
+
+async def send_persona_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
+    msg = update.effective_message
+    chat_id = msg.chat_id
+    period = persona_period()
+    path = PERSONA_IMAGES[period]
+    if not os.path.exists(path):
+        log.warning("persona image missing: %s", path)
+        await msg.reply_text(random.choice(FALLBACKS.get(lang, FALLBACKS["tr"])))
+        return
+
+    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+    with open(path, "rb") as photo:
+        await msg.reply_photo(photo=photo, caption=persona_caption(lang, period))
+    save_message(chat_id, "assistant", f"[sent Natasha {period} persona photo]")
+
+
 def _download_bytes(url: str, headers: dict | None = None):
     r = requests.get(url, headers=headers or {"User-Agent": "Mozilla/5.0"}, timeout=20)
     r.raise_for_status()
@@ -853,6 +920,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
              "REPLY" if will_reply else "skip", msg.text[:80])
 
     if not will_reply:
+        return
+
+    if wants_persona_photo(msg.text):
+        await send_persona_photo(update, context, media_lang(msg.text))
         return
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)

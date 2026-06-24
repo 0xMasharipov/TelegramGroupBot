@@ -1,3 +1,5 @@
+![Natasha Telegram Group Bot banner](assets/natasha_readme_banner.png)
+
 # Natasha Telegram Group Bot
 
 **Natasha** is a Grok-powered Telegram group bot for chaotic, multilingual group chats. She replies like a real chat member, remembers lightweight context, reacts to photos, and can drop GIFs, Imgflip meme templates, and MyInstants voice-note sounds without needing slash commands.
@@ -48,6 +50,7 @@ Natasha uses Telegram polling, so local development does not need a webhook or p
 | `DB_PATH` | No | `natasha.db` | SQLite database location |
 | `TENOR_API_KEY` | No | empty | Enables Tenor GIF reactions |
 | `OWNER_ID` | No | not set | Set this yourself to enable owner tools |
+| `PERSONA_UTC_OFFSET_HOURS` | No | `3` | Local time offset for day/night persona photos |
 
 Imgflip meme templates and MyInstants sounds use public pages and do not require API keys.
 
@@ -80,6 +83,17 @@ Rules:
 - If no matching meme template exists, Natasha skips it instead of sending a random unrelated meme.
 - MyInstants MP3 files are converted to OGG/Opus voice notes when `ffmpeg` is available.
 - If voice conversion fails, Natasha falls back to regular Telegram audio.
+
+## Persona Photos
+
+When a user asks Natasha to send her photo, selfie, avatar, or picture, she sends a deployable avatar asset instead of describing it in text. The bot chooses the variant by local time:
+
+| Time | Asset |
+| --- | --- |
+| Day, 07:00-18:59 | `assets/natasha_persona_day.png` |
+| Night, 19:00-06:59 | `assets/natasha_persona_night.png` |
+
+The default time offset is UTC+3. Change `PERSONA_UTC_OFFSET_HOURS` if your deployment should use another local time.
 
 ## Commands
 
@@ -126,6 +140,10 @@ After dependency changes, push the latest commits and force a clean rebuild. If 
 
 ```text
 .
+├── assets/
+│   ├── natasha_readme_banner.png
+│   ├── natasha_persona_day.png
+│   └── natasha_persona_night.png
 ├── natasha_bot.py      # bot logic, Grok calls, media scraping, commands
 ├── requirements.txt    # Python dependencies
 ├── nixpacks.toml       # Nixpacks build/start config
