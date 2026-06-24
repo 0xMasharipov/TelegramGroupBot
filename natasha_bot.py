@@ -73,6 +73,27 @@ PERSONA_IMAGES = {
     "day": os.path.join(BASE_DIR, "assets", "natasha_persona_day.png"),
     "night": os.path.join(BASE_DIR, "assets", "natasha_persona_night.png"),
 }
+NATASHA_IMAGINE_PROMPT = (
+    "Close-up mascot avatar selfie of Natasha, a mischievous chaotic young woman character: "
+    "confident smug smirk, glowing neon eyes, sharp expressive features, messy stylish dark "
+    "hair, playful unhinged energy. Slavic / Russian streetwear aesthetic, fully clothed, "
+    "dark oversized hoodie and jacket, bold accessories. Cyberpunk lighting with neon magenta "
+    "and electric-blue rim light against a dark moody background. Bold clean cartoon / "
+    "anime-inspired illustration, thick outlines, high contrast, vibrant colors. Keep her "
+    "recognizable across images: same face shape, same glowing eyes, same messy dark hair, "
+    "same mischievous expression. No photorealism, no nudity, no explicit content, no extra "
+    "characters, no watermark."
+)
+NATASHA_DAY_IMAGINE_PROMPT = (
+    NATASHA_IMAGINE_PROMPT
+    + " Daytime variant: brighter city daylight mixed with subtle neon accents, warmer highlights, "
+      "still cyberpunk and chaotic, clear readable face."
+)
+NATASHA_NIGHT_IMAGINE_PROMPT = (
+    NATASHA_IMAGINE_PROMPT
+    + " Night variant: darker moody background, stronger neon magenta and electric-blue glow, "
+      "more intense smug expression."
+)
 
 # /russianroulette settings
 MUTE_ON_DEATH = True           # mute the loser (needs the bot to be admin)
@@ -137,6 +158,11 @@ SYSTEM_PROMPT = (
     "If the user asks you to send/drop/find a meme, sound, audio, voice, ses, or instant, "
     "DO NOT say you will send it — actually include the matching [meme:] or [sound:] tag. "
     "These tags are tool calls; the chat will not see them.\n"
+    "NATASHA IMAGE PERSONA: if the user asks for an Imagine/image prompt, generated selfie, "
+    "or generated image of you/Natasha, use this exact visual identity as the base prompt: "
+    f"{NATASHA_IMAGINE_PROMPT} Add the requested pose, setting, outfit-safe variation, "
+    "time of day, or mood only if the user asked for it. Keep Natasha fully clothed and "
+    "recognizable.\n"
     "You CAN see images people send and should react to them naturally.\n"
     "Do NOT output any [VOICE_MESSAGE] or [MEME_AUDIO_REQUEST] tags — only [gif:] / [meme:] / [sound:]."
 )
@@ -512,9 +538,29 @@ def wants_persona_photo(text: str) -> bool:
     )
 
 
+def wants_persona_imagine_prompt(text: str) -> bool:
+    lowered = text.lower()
+    imagine_words = (
+        "imagine", "prompt", "generate", "draw", "create image", "make image",
+        "image prompt", "selfie prompt", "görsel prompt", "resim prompt",
+        "промпт", "сгенерируй", "нарисуй",
+    )
+    persona_words = (
+        "natasha", "your", "you", "selfie", "avatar", "photo", "picture",
+        "наташа", "тебя", "себя", "селфи", "аватар",
+    )
+    return any(word in lowered for word in imagine_words) and any(
+        word in lowered for word in persona_words
+    )
+
+
 def persona_period():
     local = datetime.now(timezone.utc) + timedelta(hours=PERSONA_UTC_OFFSET_HOURS)
     return "day" if 7 <= local.hour < 19 else "night"
+
+
+def persona_imagine_prompt(period: str):
+    return NATASHA_DAY_IMAGINE_PROMPT if period == "day" else NATASHA_NIGHT_IMAGINE_PROMPT
 
 
 def persona_caption(lang: str, period: str):
@@ -549,6 +595,21 @@ async def send_persona_photo(update: Update, context: ContextTypes.DEFAULT_TYPE,
     with open(path, "rb") as photo:
         await msg.reply_photo(photo=photo, caption=persona_caption(lang, period))
     save_message(chat_id, "assistant", f"[sent Natasha {period} persona photo]")
+
+
+async def send_persona_imagine_prompt(update: Update, lang: str):
+    msg = update.effective_message
+    chat_id = msg.chat_id
+    period = persona_period()
+    labels = {
+        "tr": "Natasha imagine promptu",
+        "ru": "Imagine-промпт Наташи",
+        "en": "Natasha Imagine prompt",
+    }
+    label = labels.get(lang, labels["en"])
+    prompt = persona_imagine_prompt(period)
+    await msg.reply_text(f"{label} ({period}):\n\n{prompt}")
+    save_message(chat_id, "assistant", f"[sent Natasha {period} imagine prompt]")
 
 
 def _download_bytes(url: str, headers: dict | None = None):
@@ -920,6 +981,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
              "REPLY" if will_reply else "skip", msg.text[:80])
 
     if not will_reply:
+        return
+
+    if wants_persona_imagine_prompt(msg.text):
+        await send_persona_imagine_prompt(update, media_lang(msg.text))
         return
 
     if wants_persona_photo(msg.text):

@@ -1,4 +1,4 @@
-![Natasha Telegram Group Bot banner](/natasha_readme_banner.png)
+![Natasha Telegram Group Bot banner](assets/natasha_readme_banner.png)
 
 # Natasha Telegram Group Bot
 
@@ -94,6 +94,16 @@ When a user asks Natasha to send her photo, selfie, avatar, or picture, she send
 | Night, 19:00-06:59 | `assets/natasha_persona_night.png` |
 
 The default time offset is UTC+3. Change `PERSONA_UTC_OFFSET_HOURS` if your deployment should use another local time.
+
+### Natasha Imagine Prompt
+
+Use this as the base prompt for Grok Imagine when generating Natasha selfies or new persona images:
+
+```text
+Close-up mascot avatar selfie of Natasha, a mischievous chaotic young woman character: confident smug smirk, glowing neon eyes, sharp expressive features, messy stylish dark hair, playful unhinged energy. Slavic / Russian streetwear aesthetic, fully clothed, dark oversized hoodie and jacket, bold accessories. Cyberpunk lighting with neon magenta and electric-blue rim light against a dark moody background. Bold clean cartoon / anime-inspired illustration, thick outlines, high contrast, vibrant colors. Keep her recognizable across images: same face shape, same glowing eyes, same messy dark hair, same mischievous expression. No photorealism, no nudity, no explicit content, no extra characters, no watermark.
+```
+
+Add only the requested pose, setting, safe outfit variation, time of day, or mood. Keep the same visual identity across every generated image.
 
 ## Commands
 
