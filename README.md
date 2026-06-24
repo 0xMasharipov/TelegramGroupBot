@@ -1,4 +1,4 @@
-![Natasha Telegram Group Bot banner](natasha_readme_banner.png)
+![Natasha Telegram Group Bot banner](assets/natasha_readme_banner.png)
 
 # Natasha Telegram Group Bot
 
