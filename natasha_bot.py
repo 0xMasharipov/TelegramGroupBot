@@ -17,13 +17,16 @@ Setup:
 
 import os
 import re
+import base64
 import random
 import asyncio
 import sqlite3
 import logging
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
+import httpx
 from openai import OpenAI
 from telegram import Update, ChatPermissions
 from telegram.constants import ChatAction
@@ -36,10 +39,14 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 XAI_API_KEY    = os.environ["XAI_API_KEY"]
 OWNER_ID       = int(os.environ.get("OWNER_ID", "1346274959"))  # only this user may run commands
 
+# Optional media modules — each works only if its key is set (otherwise skipped).
+TENOR_API_KEY     = os.environ.get("TENOR_API_KEY", "")       # GIF/meme reactions (tenor.googleapis.com)
+FREESOUND_API_KEY = os.environ.get("FREESOUND_API_KEY", "")   # CC-licensed sound effects (freesound.org)
+
 MODEL         = "grok-4.20"    # xAI model; reasoning + non-reasoning modes
 CHAOS_CHANCE  = 0.06           # ~6% chance to butt into a random message
 HISTORY_LEN   = 12             # messages of context kept per chat
-MAX_TOKENS    = 360            # room for a few short bubbles
+MAX_TOKENS    = 160            # hard length cap — keeps replies texty, not essays
 TEMPERATURE   = 1.0
 WAKE_WORDS    = ["gooner", "natasha", "наташа"]  # wakes when any appears in a message
 MAX_BUBBLES   = 3              # hard ceiling on bubbles; default behaviour is 1
@@ -66,11 +73,12 @@ SYSTEM_PROMPT = (
     "- English -> natural urban English (bro, ngl, lowkey, wild, damn). Not exaggerated, "
     "never a parody.\n"
     "Don't mix languages in one reply unless the user did.\n\n"
-    "REPLY STYLE: real people are not consistent. VARY everything. Sometimes a single word "
-    "('nah', 'kanka yapma', 'по факту'), sometimes one line, sometimes 2-3 sentences when you "
-    "actually have something to say. Don't always be short and don't always be long — read the "
-    "moment. Often react FIRST ('wait', 'bro', 'ну погоди', 'kanka bir dakika'). Don't "
-    "over-explain, don't answer perfectly every time — small imperfections are human.\n\n"
+    "REPLY STYLE: real Telegram messages are SHORT. Default to a few words or one short line. "
+    "Sometimes a single word ('nah', 'kanka yapma', 'по факту'). Only OCCASIONALLY two short "
+    "sentences, and only when you genuinely have a point to make. NEVER write a paragraph, "
+    "never lecture, never explain at length — if you catch yourself going long, cut it. Vary "
+    "it so it's not robotic, but the baseline is short. Often react FIRST ('wait', 'bro', "
+    "'ну погоди', 'kanka bir dakika'). Don't over-explain, don't answer perfectly every time.\n\n"
     "MULTI-MESSAGE: by DEFAULT, reply with ONE single message. Splitting into separate bubbles "
     "is the EXCEPTION, not the habit — only do it once in a while when something is genuinely "
     "emotional, funny, shocking or embarrassing and the beats land better as 2 quick texts. "
@@ -90,8 +98,16 @@ SYSTEM_PROMPT = (
     "we're not opening the criminal expansion pack today — wanna talk legit ways instead?' "
     "Hard limits you never cross: no slurs, no harassment of protected groups, nothing "
     "sexual involving minors, nothing that helps real-world harm.\n\n"
-    "OUTPUT: text only. Do NOT output any [VOICE_MESSAGE], [MEME_AUDIO_REQUEST] or similar "
-    "tags — just talk."
+    "REACTIONS (use SPARINGLY, like a real person who occasionally drops a meme or a sound — "
+    "definitely not every message):\n"
+    "- To react with a meme/GIF, add a line: [gif: short search terms] (e.g. [gif: facepalm], "
+    "[gif: mind blown], [gif: awkward].)\n"
+    "- To react with a sound effect, add a line: [sound: short search terms] (e.g. "
+    "[sound: airhorn], [sound: sad violin], [sound: rimshot].)\n"
+    "Keep the search terms in English even if you're talking in another language. Put the tag "
+    "on its own line. Most messages have NO tag. Never use more than one of each per reply.\n"
+    "You CAN see images people send and should react to them naturally.\n"
+    "Do NOT output any [VOICE_MESSAGE] or [MEME_AUDIO_REQUEST] tags — only [gif:] / [sound:]."
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -304,6 +320,111 @@ def split_bubbles(text: str) -> list[str]:
     return bubbles[:MAX_BUBBLES] if bubbles else [text.strip()]
 
 
+# --- media reactions ---------------------------------------------------------
+_GIF_TAG   = re.compile(r"\[gif:\s*([^\]]+)\]", re.IGNORECASE)
+_SOUND_TAG = re.compile(r"\[sound:\s*([^\]]+)\]", re.IGNORECASE)
+
+
+def extract_media(text: str):
+    """Pull the first [gif:] and [sound:] queries out of the reply and return
+    (clean_text, gif_query_or_None, sound_query_or_None)."""
+    gif = _GIF_TAG.search(text)
+    snd = _SOUND_TAG.search(text)
+    gif_q = gif.group(1).strip() if gif else None
+    snd_q = snd.group(1).strip() if snd else None
+    clean = _SOUND_TAG.sub("", _GIF_TAG.sub("", text)).strip()
+    return clean, gif_q, snd_q
+
+
+async def fetch_gif(query: str):
+    """Search Tenor for a reaction GIF; returns a GIF url or None."""
+    if not TENOR_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get("https://tenor.googleapis.com/v2/search", params={
+                "q": query, "key": TENOR_API_KEY, "limit": 12,
+                "media_filter": "gif", "random": "true", "contentfilter": "medium",
+            })
+            results = r.json().get("results", [])
+        if not results:
+            return None
+        item = random.choice(results)
+        fmts = item.get("media_formats", {})
+        return (fmts.get("gif") or fmts.get("tinygif") or {}).get("url")
+    except Exception as e:
+        log.warning("tenor fetch failed: %s", e)
+        return None
+
+
+async def fetch_sound(query: str):
+    """Search Freesound for a CC-licensed clip; returns (mp3_bytes, name) or None."""
+    if not FREESOUND_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get("https://freesound.org/apiv2/search/text/", params={
+                "query": query, "fields": "name,previews",
+                "page_size": 10, "filter": "duration:[0.3 TO 12]",
+                "token": FREESOUND_API_KEY,
+            })
+            results = r.json().get("results", [])
+            results = [x for x in results if x.get("previews")]
+            if not results:
+                return None
+            item = random.choice(results[:10])
+            url = item["previews"].get("preview-hq-mp3") or item["previews"].get("preview-lq-mp3")
+            audio = await c.get(url)
+            return audio.content, item.get("name", "sound")
+    except Exception as e:
+        log.warning("freesound fetch failed: %s", e)
+        return None
+
+
+async def send_reactions(context, chat_id, gif_q, snd_q):
+    """Fire off any requested GIF / sound reactions, best-effort."""
+    if gif_q:
+        url = await fetch_gif(gif_q)
+        if url:
+            try:
+                await context.bot.send_animation(chat_id, url)
+            except Exception as e:
+                log.warning("send_animation failed: %s", e)
+    if snd_q:
+        got = await fetch_sound(snd_q)
+        if got:
+            data, name = got
+            try:
+                await context.bot.send_audio(chat_id, audio=BytesIO(data),
+                                             filename=f"{name[:30]}.mp3", title=name[:30])
+            except Exception as e:
+                log.warning("send_audio failed: %s", e)
+
+
+def grok_vision_reply(chat_id: int, b64: str, name: str, caption: str) -> str:
+    """Grok 'sees' the image plus recent text context and reacts in character."""
+    sys = SYSTEM_PROMPT
+    roster = roster_text(chat_id)
+    if roster:
+        sys += "\n\nPEOPLE IN THIS CHAT:\n" + roster
+    msgs = [{"role": "system", "content": sys}, *load_history(chat_id, HISTORY_LEN)]
+    note = f"{name} just sent this photo."
+    if caption:
+        note += f' caption: "{caption}"'
+    note += " React to it like a real person would."
+    msgs.append({"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        {"type": "text", "text": note},
+    ]})
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL, messages=msgs, temperature=TEMPERATURE, max_tokens=MAX_TOKENS)
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        log.error("Grok vision error: %s", e)
+        return random.choice(["bu ne ya 💀", "что это вообще", "bro what is this"])
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.text:
@@ -338,16 +459,64 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = grok_reply(chat_id)
     save_message(chat_id, "assistant", reply)
 
-    bubbles = split_bubbles(reply)
+    text, gif_q, snd_q = extract_media(reply)
+    bubbles = split_bubbles(text) if text else []
     for i, bubble in enumerate(bubbles):
         if i > 0:
-            # human-ish pause between bubbles, scaled to length
             await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
             await asyncio.sleep(min(0.6 + len(bubble) * 0.025, 2.5))
         if i == 0:
             await msg.reply_text(bubble)
         else:
             await context.bot.send_message(chat_id, bubble)
+
+    await send_reactions(context, chat_id, gif_q, snd_q)
+
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or not msg.photo:
+        return
+
+    chat_id = msg.chat_id
+    user = msg.from_user
+    if user:
+        remember_user(chat_id, user)
+    name = display_name(chat_id, user) if user else "someone"
+    caption = msg.caption or ""
+    save_message(chat_id, "user", f"[{name} sent a photo]"
+                 + (f' (caption: "{caption}")' if caption else ""))
+
+    # React under the same rules as text: addressed, replied-to, or random chaos.
+    text_lower = caption.lower()
+    bot_username = (context.bot.username or "").lower()
+    addressed = (f"@{bot_username}" in text_lower
+                 or any(w in text_lower for w in WAKE_WORDS))
+    replied_to_me = bool(msg.reply_to_message and msg.reply_to_message.from_user
+                         and msg.reply_to_message.from_user.id == context.bot.id)
+    if not (addressed or replied_to_me or random.random() < CHAOS_CHANCE):
+        return
+
+    # Download the largest version of the photo and base64-encode it.
+    try:
+        f = await context.bot.get_file(msg.photo[-1].file_id)
+        raw = await f.download_as_bytearray()
+    except Exception as e:
+        log.warning("photo download failed: %s", e)
+        return
+    b64 = base64.b64encode(bytes(raw)).decode()
+
+    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    reply = grok_vision_reply(chat_id, b64, name, caption)
+    save_message(chat_id, "assistant", reply)
+
+    text, gif_q, snd_q = extract_media(reply)
+    for i, bubble in enumerate(split_bubbles(text) if text else []):
+        if i > 0:
+            await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+            await asyncio.sleep(min(0.6 + len(bubble) * 0.025, 2.5))
+        await (msg.reply_text(bubble) if i == 0 else context.bot.send_message(chat_id, bubble))
+    await send_reactions(context, chat_id, gif_q, snd_q)
 
 
 async def russian_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -490,6 +659,7 @@ def main():
     app.add_handler(CommandHandler("forget", owner_only(forget_cmd)))
     app.add_handler(CommandHandler(["whoami", "memory"], owner_only(whoami_cmd)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     log.info("Bot is live and feral.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
