@@ -1,6 +1,6 @@
 # Natasha Telegram Group Bot
 
-Natasha is a Telegram group chat bot powered by xAI Grok. It reads group chatter, keeps lightweight memory in SQLite, replies in the user's language, and can automatically drop GIFs, Imgflip meme templates, and MyInstants sound reactions when Grok decides the moment needs it.
+Natasha is a Telegram group chat bot powered by xAI Grok. It reads group chatter, keeps lightweight memory in SQLite, replies in the user's language, and can automatically drop GIFs, Imgflip meme templates, and MyInstants voice/sound reactions when Grok decides the moment needs it.
 
 ## Features
 
@@ -10,7 +10,7 @@ Natasha is a Telegram group chat bot powered by xAI Grok. It reads group chatter
 - Photo understanding through Grok vision
 - Tenor GIF reactions with `[gif: query]`
 - Imgflip meme template reactions with `[meme: lang | query]`
-- MyInstants sound reactions with `[sound: lang | query]`
+- MyInstants sound reactions sent as Telegram voice notes when ffmpeg is available
 - Owner-only memory commands
 - Russian roulette group mini-game
 
@@ -59,7 +59,7 @@ The bot uses polling, so it does not need a public webhook URL.
 The repo includes both:
 
 - `Procfile`: `web: python natasha_bot.py`
-- `nixpacks.toml`: installs `requirements.txt` and starts `python natasha_bot.py`
+- `nixpacks.toml`: installs Python, ffmpeg, `requirements.txt`, and starts `python natasha_bot.py`
 
 For Railway or similar hosts, set the required environment variables in the project settings. For persistent memory, mount a volume and set:
 
@@ -80,7 +80,7 @@ Grok is instructed to use these tags sparingly and only when a reaction fits:
 [sound: en | airhorn]
 ```
 
-The bot strips these tags from text replies, downloads the matching media, and sends it to the chat. If Grok omits the language part, the bot infers `tr`, `ru`, or `en` from the reply text.
+The bot strips these tags from text replies, downloads the matching media, and sends it to the chat. Sounds are converted to Telegram voice-note format when ffmpeg is available, with normal audio as a fallback. If Grok omits the language part, the bot infers `tr`, `ru`, or `en` from the reply text.
 
 ## Commands
 

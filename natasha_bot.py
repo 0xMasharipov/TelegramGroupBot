@@ -22,11 +22,17 @@ import random
 import asyncio
 import sqlite3
 import logging
+import shutil
+import subprocess
+import tempfile
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from urllib.parse import urljoin
 
 import httpx
+import requests
+from bs4 import BeautifulSoup
 from openai import OpenAI
 from telegram import Update, ChatPermissions
 from telegram.constants import ChatAction
@@ -41,7 +47,6 @@ OWNER_ID       = int(os.environ.get("OWNER_ID", "1346274959"))  # only this user
 
 # Optional media modules — each works only if its key is set (otherwise skipped).
 TENOR_API_KEY     = os.environ.get("TENOR_API_KEY", "")       # GIF/meme reactions (tenor.googleapis.com)
-FREESOUND_API_KEY = os.environ.get("FREESOUND_API_KEY", "")   # CC-licensed sound effects (freesound.org)
 
 MODEL         = "grok-4.20"    # xAI model; reasoning + non-reasoning modes
 CHAOS_CHANCE  = 0.06           # ~6% chance to butt into a random message
@@ -102,12 +107,18 @@ SYSTEM_PROMPT = (
     "definitely not every message):\n"
     "- To react with a meme/GIF, add a line: [gif: short search terms] (e.g. [gif: facepalm], "
     "[gif: mind blown], [gif: awkward].)\n"
-    "- To react with a sound effect, add a line: [sound: short search terms] (e.g. "
-    "[sound: airhorn], [sound: sad violin], [sound: rimshot].)\n"
-    "Keep the search terms in English even if you're talking in another language. Put the tag "
+    "- To react with an Imgflip meme template image, add a line: [meme: lang | short template search terms] "
+    "(e.g. [meme: en | drake], [meme: tr | distracted boyfriend], [meme: ru | this is fine]).\n"
+    "- To react with a MyInstants sound effect, add a line: [sound: lang | short search terms] "
+    "(e.g. [sound: tr | bass boosted], [sound: ru | bruh], [sound: en | airhorn]).\n"
+    "Use lang as tr, ru, or en to match the chat language. You may omit lang only if obvious. "
+    "Keep sound search terms and meme template hints simple. Put the tag "
     "on its own line. Most messages have NO tag. Never use more than one of each per reply.\n"
+    "If the user asks you to send/drop/find a meme, sound, audio, voice, ses, or instant, "
+    "DO NOT say you will send it — actually include the matching [meme:] or [sound:] tag. "
+    "These tags are tool calls; the chat will not see them.\n"
     "You CAN see images people send and should react to them naturally.\n"
-    "Do NOT output any [VOICE_MESSAGE] or [MEME_AUDIO_REQUEST] tags — only [gif:] / [sound:]."
+    "Do NOT output any [VOICE_MESSAGE] or [MEME_AUDIO_REQUEST] tags — only [gif:] / [meme:] / [sound:]."
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -296,10 +307,10 @@ def grok_reply(chat_id: int) -> str:
         return random.choice(FALLBACKS[detect_lang(last)])
 
 
-# Lines like [VOICE_MESSAGE], mood:, voice_script: etc. — stripped if the model leaks them.
+# Lines like [VOICE_MESSAGE], mood:, voice_script: etc. are stripped if the model leaks them.
 _TAG_LINE = re.compile(
-    r"^\s*(\[?(MEME_AUDIO_REQUEST|VOICE_MESSAGE)\]?|mood|energy|query|audio_type|"
-    r"duration|copyright_safe|voice_script)\s*:.*$",
+    r"^\s*(?:\[?(?:MEME_AUDIO_REQUEST|VOICE_MESSAGE)\]?\s*(?::.*)?|"
+    r"(?:mood|energy|query|audio_type|duration|copyright_safe|voice_script)\s*:.*)$",
     re.IGNORECASE,
 )
 
@@ -321,19 +332,341 @@ def split_bubbles(text: str) -> list[str]:
 
 
 # --- media reactions ---------------------------------------------------------
-_GIF_TAG   = re.compile(r"\[gif:\s*([^\]]+)\]", re.IGNORECASE)
-_SOUND_TAG = re.compile(r"\[sound:\s*([^\]]+)\]", re.IGNORECASE)
+_GIF_TAGS = [
+    re.compile(r"\[gif:\s*([^\]]+)\]", re.IGNORECASE),
+    re.compile(r"(?im)^\s*gif\s*:\s*(.+?)\s*$"),
+]
+_MEME_TAGS = [
+    re.compile(r"\[meme:\s*([^\]]+)\]", re.IGNORECASE),
+    re.compile(r"(?im)^\s*meme\s*:\s*(.+?)\s*$"),
+    re.compile(r"(?im)^\s*meme_template\s*:\s*(.+?)\s*$"),
+]
+_SOUND_TAGS = [
+    re.compile(r"\[(?:sound|voice):\s*([^\]]+)\]", re.IGNORECASE),
+    re.compile(r"\[(?:MEME_AUDIO_REQUEST|VOICE_MESSAGE):\s*([^\]]+)\]", re.IGNORECASE),
+    re.compile(r"(?im)^\s*(?:sound|voice|audio|meme_audio_request)\s*:\s*(.+?)\s*$"),
+]
+_LEGACY_MEDIA_MARKER = re.compile(
+    r"(?im)^\s*\[?(?:MEME_AUDIO_REQUEST|VOICE_MESSAGE)\]?\s*(?::.*)?$"
+)
+_LEGACY_MEDIA_QUERY = re.compile(r"(?im)^\s*(?:query|voice_script)\s*:\s*(.+?)\s*$")
+_MEDIA_TAG_PATTERNS = _GIF_TAGS + _MEME_TAGS + _SOUND_TAGS + [
+    _LEGACY_MEDIA_MARKER,
+    _LEGACY_MEDIA_QUERY,
+]
+MEDIA_LANG_REGIONS = {
+    "tr": "tr",
+    "turkish": "tr",
+    "ru": "ru",
+    "russian": "ru",
+    "en": "us",
+    "eng": "us",
+    "english": "us",
+    "us": "us",
+    "uk": "gb",
+    "gb": "gb",
+}
+
+
+def _first_media_match(text: str, patterns):
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match and match.lastindex:
+            return match.group(1).strip()
+    return None
 
 
 def extract_media(text: str):
-    """Pull the first [gif:] and [sound:] queries out of the reply and return
-    (clean_text, gif_query_or_None, sound_query_or_None)."""
-    gif = _GIF_TAG.search(text)
-    snd = _SOUND_TAG.search(text)
-    gif_q = gif.group(1).strip() if gif else None
-    snd_q = snd.group(1).strip() if snd else None
-    clean = _SOUND_TAG.sub("", _GIF_TAG.sub("", text)).strip()
-    return clean, gif_q, snd_q
+    """Pull the first media queries out of the reply and strip their tags."""
+    gif_q = _first_media_match(text, _GIF_TAGS)
+    meme_q = _first_media_match(text, _MEME_TAGS)
+    snd_q = _first_media_match(text, _SOUND_TAGS)
+    if not snd_q and _LEGACY_MEDIA_MARKER.search(text):
+        snd_q = _first_media_match(text, [_LEGACY_MEDIA_QUERY])
+
+    clean = text
+    for pattern in _MEDIA_TAG_PATTERNS:
+        clean = pattern.sub("", clean)
+    clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+    return clean, gif_q, meme_q, snd_q
+
+
+def media_lang(text: str) -> str:
+    """Infer a compact language code for media lookup."""
+    lowered = text.lower()
+    if any("\u0400" <= ch <= "\u04FF" for ch in text):
+        return "ru"
+    if any(ch in "çğıöşü" for ch in lowered):
+        return "tr"
+    tr_words = {"abi", "kanka", "lan", "yok", "tamam", "cidden", "şaka", "ses", "meme"}
+    if any(re.search(rf"\b{re.escape(word)}\b", lowered) for word in tr_words):
+        return "tr"
+    return "en"
+
+
+def parse_media_spec(spec: str, default_lang: str = "en"):
+    """Parse 'lang | query' tags while keeping plain 'query' tags compatible."""
+    parts = [p.strip() for p in spec.split("|", 1)]
+    if len(parts) == 2 and parts[0].lower() in MEDIA_LANG_REGIONS:
+        return parts[0].lower(), parts[1]
+    return default_lang, spec.strip()
+
+
+def requested_media_from_user(text: str, default_lang: str):
+    """Infer a direct media request when Grok forgot to emit a media tag."""
+    lowered = text.lower()
+    action_words = (
+        "send", "drop", "find", "show", "give", "play",
+        "gönder", "yolla", "ver", "bul", "çal",
+        "скинь", "отправь", "найди", "дай", "покажи",
+    )
+    asked_action = any(re.search(rf"\b{re.escape(word)}\b", lowered) for word in action_words)
+    asks_meme = any(word in lowered for word in ("meme", "mem", "caps"))
+    asks_sound = any(word in lowered for word in (
+        "sound", "voice", "audio", "instant", "myinstants", "ses", "sesi", "sesli",
+        "звук", "войс", "аудио",
+    ))
+    if not asked_action and not any(word in lowered for word in ("meme at", "ses at")):
+        return None, None
+
+    cleaned = re.sub(
+        r"(?i)\b(send|drop|find|show|give|play|meme|mem|caps|sound|voice|audio|instant|"
+        r"myinstants|gönder|yolla|ver|bul|çal|ses|sesi|sesli|at|скинь|отправь|найди|дай|"
+        r"покажи|звук|войс|аудио)\b",
+        " ",
+        text,
+    )
+    query = re.sub(r"\s+", " ", cleaned).strip(" .,!?:;-") or text.strip()
+    spec = f"{default_lang} | {query}"
+    return (spec if asks_meme else None), (spec if asks_sound else None)
+
+
+def _download_bytes(url: str, headers: dict | None = None):
+    r = requests.get(url, headers=headers or {"User-Agent": "Mozilla/5.0"}, timeout=20)
+    r.raise_for_status()
+    return r.content
+
+
+def mp3_to_ogg_opus(data: bytes):
+    """Convert MP3 bytes to Telegram voice-note compatible OGG/Opus bytes."""
+    if not shutil.which("ffmpeg"):
+        return None
+
+    in_path = out_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as src:
+            src.write(data)
+            in_path = src.name
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as dst:
+            out_path = dst.name
+
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", in_path,
+                "-vn", "-ac", "1", "-ar", "48000",
+                "-c:a", "libopus", "-b:a", "32k",
+                out_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=True,
+        )
+        with open(out_path, "rb") as f:
+            return f.read()
+    except Exception as e:
+        log.warning("voice conversion failed: %s", e)
+        return None
+    finally:
+        for path in (in_path, out_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+def _best_title_match(items, query: str):
+    if not items:
+        return None
+    q = query.lower().strip()
+    if q:
+        for item in items:
+            if q in item["title"].lower():
+                return item
+        words = [w for w in re.split(r"\W+", q) if len(w) > 2]
+        if words:
+            scored = []
+            for item in items:
+                title = item["title"].lower()
+                score = sum(1 for word in words if word in title)
+                if score:
+                    scored.append((score, item))
+            if scored:
+                scored.sort(key=lambda pair: pair[0], reverse=True)
+                return scored[0][1]
+    return random.choice(items)
+
+
+def imgflip_template_candidates():
+    """Scrape Imgflip's meme templates page for template names and links."""
+    r = requests.get(
+        "https://imgflip.com/memetemplates",
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    candidates = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        title = a.get_text(" ", strip=True)
+        if href.startswith("/meme/") and title:
+            candidates.append({
+                "title": title,
+                "url": urljoin("https://imgflip.com", href),
+            })
+
+    seen = set()
+    unique = []
+    for item in candidates:
+        key = item["url"]
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def imgflip_template_image_url(page_url: str):
+    """Find the blank template image URL on an Imgflip template page."""
+    r = requests.get(page_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    for selector in [
+        ('meta', {"property": "og:image"}),
+        ('meta', {"name": "twitter:image"}),
+    ]:
+        tag = soup.find(*selector)
+        if tag and tag.get("content"):
+            return urljoin("https://imgflip.com", tag["content"])
+
+    for img in soup.find_all("img", src=True):
+        src = img["src"]
+        if "i.imgflip.com" in src or "/s/meme/" in src:
+            return urljoin("https://imgflip.com", src)
+
+    return None
+
+
+def imgflip_download_template(query: str, lang: str = "en"):
+    picked = _best_title_match(imgflip_template_candidates(), query)
+    if not picked:
+        return None
+    image_url = imgflip_template_image_url(picked["url"])
+    if not image_url:
+        return None
+    return _download_bytes(image_url), picked["title"]
+
+
+async def fetch_meme(query: str, lang: str = "en"):
+    try:
+        return await asyncio.to_thread(imgflip_download_template, query, lang)
+    except Exception as e:
+        log.warning("imgflip template fetch failed: %s", e)
+        return None
+
+
+def myinstants_candidates_from_soup(soup: BeautifulSoup):
+    candidates = []
+
+    for tag in soup.find_all(attrs={"onclick": True}):
+        onclick = tag.get("onclick", "")
+        match = re.search(r"play\(['\"]([^'\"]+\.mp3[^'\"]*)['\"]\)", onclick)
+        if match:
+            title = tag.get("title") or tag.get_text(" ", strip=True) or "sound"
+            candidates.append({
+                "title": title,
+                "mp3_url": urljoin("https://www.myinstants.com", match.group(1)),
+            })
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        title = a.get_text(" ", strip=True)
+        if "/instant/" in href and title:
+            candidates.append({
+                "title": title,
+                "page_url": urljoin("https://www.myinstants.com", href),
+            })
+
+    seen = set()
+    unique = []
+    for item in candidates:
+        key = item.get("mp3_url") or item.get("page_url")
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def myinstants_search_candidates(query: str):
+    search_url = "https://www.myinstants.com/en/search/"
+    r = requests.get(
+        search_url,
+        params={"name": query},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    return myinstants_candidates_from_soup(BeautifulSoup(r.text, "html.parser"))
+
+
+def myinstants_trending_candidates(region: str = "tr"):
+    """
+    Scrape a MyInstants region page for instant pages and inline MP3s.
+    """
+    url = f"https://www.myinstants.com/en/index/{region}/"
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+    r.raise_for_status()
+    return myinstants_candidates_from_soup(BeautifulSoup(r.text, "html.parser"))
+
+
+def myinstants_mp3_from_page(page_url: str):
+    r = requests.get(page_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    for a in soup.find_all("a", href=True):
+        text = a.get_text(" ", strip=True).lower()
+        href = a["href"]
+        if "download mp3" in text or href.lower().endswith(".mp3"):
+            return urljoin("https://www.myinstants.com", href)
+
+    for tag in soup.find_all(attrs={"onclick": True}):
+        match = re.search(r"play\(['\"]([^'\"]+\.mp3[^'\"]*)['\"]\)", tag.get("onclick", ""))
+        if match:
+            return urljoin("https://www.myinstants.com", match.group(1))
+
+    return None
+
+
+def myinstants_download_sound(query: str, lang: str = "en"):
+    region = MEDIA_LANG_REGIONS.get(lang.lower(), lang.lower() or "us")
+    candidates = myinstants_search_candidates(query)
+    picked = _best_title_match(candidates, query)
+    if not picked:
+        picked = _best_title_match(myinstants_trending_candidates(region), query)
+    if not picked:
+        return None
+
+    mp3_url = picked.get("mp3_url")
+    if not mp3_url and picked.get("page_url"):
+        mp3_url = myinstants_mp3_from_page(picked["page_url"])
+    if not mp3_url:
+        return None
+
+    return _download_bytes(mp3_url), picked["title"]
 
 
 async def fetch_gif(query: str):
@@ -357,32 +690,41 @@ async def fetch_gif(query: str):
         return None
 
 
-async def fetch_sound(query: str):
-    """Search Freesound for a CC-licensed clip; returns (mp3_bytes, name) or None."""
-    if not FREESOUND_API_KEY:
-        return None
+async def fetch_sound(query: str, lang: str = "en"):
+    """Search MyInstants by query, then fall back to a language region page."""
     try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get("https://freesound.org/apiv2/search/text/", params={
-                "query": query, "fields": "name,previews",
-                "page_size": 10, "filter": "duration:[0.3 TO 12]",
-                "token": FREESOUND_API_KEY,
-            })
-            results = r.json().get("results", [])
-            results = [x for x in results if x.get("previews")]
-            if not results:
-                return None
-            item = random.choice(results[:10])
-            url = item["previews"].get("preview-hq-mp3") or item["previews"].get("preview-lq-mp3")
-            audio = await c.get(url)
-            return audio.content, item.get("name", "sound")
+        return await asyncio.to_thread(myinstants_download_sound, query, lang)
     except Exception as e:
-        log.warning("freesound fetch failed: %s", e)
+        log.warning("myinstants fetch failed: %s", e)
         return None
 
 
-async def send_reactions(context, chat_id, gif_q, snd_q):
-    """Fire off any requested GIF / sound reactions, best-effort."""
+async def send_sound_reaction(context, chat_id, data: bytes, name: str):
+    voice_data = await asyncio.to_thread(mp3_to_ogg_opus, data)
+    if voice_data:
+        try:
+            await context.bot.send_voice(
+                chat_id,
+                voice=BytesIO(voice_data),
+                filename=f"{name[:30]}.ogg",
+            )
+            return
+        except Exception as e:
+            log.warning("send_voice failed, falling back to audio: %s", e)
+
+    try:
+        await context.bot.send_audio(
+            chat_id,
+            audio=BytesIO(data),
+            filename=f"{name[:30]}.mp3",
+            title=name[:30],
+        )
+    except Exception as e:
+        log.warning("send_audio failed: %s", e)
+
+
+async def send_reactions(context, chat_id, gif_q, meme_q, snd_q, lang_hint: str = "en"):
+    """Fire off any requested GIF / meme / sound reactions, best-effort."""
     if gif_q:
         url = await fetch_gif(gif_q)
         if url:
@@ -390,15 +732,25 @@ async def send_reactions(context, chat_id, gif_q, snd_q):
                 await context.bot.send_animation(chat_id, url)
             except Exception as e:
                 log.warning("send_animation failed: %s", e)
-    if snd_q:
-        got = await fetch_sound(snd_q)
+    if meme_q:
+        meme_lang, meme_query = parse_media_spec(meme_q, lang_hint)
+        got = await fetch_meme(meme_query, meme_lang)
         if got:
             data, name = got
             try:
-                await context.bot.send_audio(chat_id, audio=BytesIO(data),
-                                             filename=f"{name[:30]}.mp3", title=name[:30])
+                await context.bot.send_photo(
+                    chat_id,
+                    photo=BytesIO(data),
+                    caption=name[:1024],
+                )
             except Exception as e:
-                log.warning("send_audio failed: %s", e)
+                log.warning("send_photo meme failed: %s", e)
+    if snd_q:
+        sound_lang, sound_query = parse_media_spec(snd_q, lang_hint)
+        got = await fetch_sound(sound_query, sound_lang)
+        if got:
+            data, name = got
+            await send_sound_reaction(context, chat_id, data, name)
 
 
 def grok_vision_reply(chat_id: int, b64: str, name: str, caption: str) -> str:
@@ -459,7 +811,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = grok_reply(chat_id)
     save_message(chat_id, "assistant", reply)
 
-    text, gif_q, snd_q = extract_media(reply)
+    text, gif_q, meme_q, snd_q = extract_media(reply)
+    lang_hint = media_lang(text or reply)
+    fallback_meme_q, fallback_snd_q = requested_media_from_user(msg.text, lang_hint)
+    meme_q = meme_q or fallback_meme_q
+    snd_q = snd_q or fallback_snd_q
     bubbles = split_bubbles(text) if text else []
     for i, bubble in enumerate(bubbles):
         if i > 0:
@@ -470,7 +826,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await context.bot.send_message(chat_id, bubble)
 
-    await send_reactions(context, chat_id, gif_q, snd_q)
+    await send_reactions(context, chat_id, gif_q, meme_q, snd_q, lang_hint)
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -510,13 +866,17 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = grok_vision_reply(chat_id, b64, name, caption)
     save_message(chat_id, "assistant", reply)
 
-    text, gif_q, snd_q = extract_media(reply)
+    text, gif_q, meme_q, snd_q = extract_media(reply)
+    lang_hint = media_lang(text or reply)
+    fallback_meme_q, fallback_snd_q = requested_media_from_user(caption, lang_hint)
+    meme_q = meme_q or fallback_meme_q
+    snd_q = snd_q or fallback_snd_q
     for i, bubble in enumerate(split_bubbles(text) if text else []):
         if i > 0:
             await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
             await asyncio.sleep(min(0.6 + len(bubble) * 0.025, 2.5))
         await (msg.reply_text(bubble) if i == 0 else context.bot.send_message(chat_id, bubble))
-    await send_reactions(context, chat_id, gif_q, snd_q)
+    await send_reactions(context, chat_id, gif_q, meme_q, snd_q, lang_hint)
 
 
 async def russian_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
