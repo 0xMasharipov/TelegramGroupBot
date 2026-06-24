@@ -1,333 +1,364 @@
-from __future__ import annotations
-import os, random, logging, threading, base64
+"""
+Unhinged Telegram group bot powered by the xAI Grok API.
+
+Reads group chatter and fires back with attitude. Responds when:
+  - someone mentions @yourbot
+  - someone replies to one of its messages
+  - randomly, for chaos (CHAOS_CHANCE)
+
+Setup:
+  1. pip install python-telegram-bot==21.6 openai
+  2. Talk to @BotFather:
+       /newbot                -> get TELEGRAM_TOKEN
+       /setprivacy -> Disable  <-- REQUIRED so it can read all group messages
+  3. Get an xAI key at https://console.x.ai  -> XAI_API_KEY
+  4. Set env vars and run:  python unhinged_bot.py
+"""
+
+import os
+import re
+import random
+import asyncio
+import sqlite3
+import logging
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict, deque
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import defaultdict
 
-PORT = int(os.environ.get("PORT", 8080))
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("natasha")
-
-_STATUS = {"msg": "starting"}
-
-class _H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = _STATUS["msg"].encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(body)
-    def log_message(self, *a):
-        pass
-
-threading.Thread(
-    target=lambda: HTTPServer(("0.0.0.0", PORT), _H).serve_forever(),
-    daemon=True,
-).start()
-log.info("HTTP server up on port %s", PORT)
-
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-XAI_API_KEY    = os.environ.get("XAI_API_KEY", "").strip()
-
-if not TELEGRAM_TOKEN:
-    _STATUS["msg"] = "ERROR: TELEGRAM_TOKEN not set"
-    log.error(_STATUS["msg"])
-
-if not XAI_API_KEY:
-    _STATUS["msg"] = "ERROR: XAI_API_KEY not set"
-    log.error(_STATUS["msg"])
-
-if not TELEGRAM_TOKEN or not XAI_API_KEY:
-    log.error("Missing env vars - sleeping forever so health check stays up")
-    threading.Event().wait()
-
-import httpx
+from openai import OpenAI
 from telegram import Update, ChatPermissions
 from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
-MODEL   = "grok-4.3"
-XAI_URL = "https://api.x.ai/v1/responses"
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+XAI_API_KEY    = os.environ["XAI_API_KEY"]
+OWNER_ID       = int(os.environ.get("OWNER_ID", "1346274959"))  # only this user may run commands
 
-ADMIN_ID      = 1346274959
-WAKE_WORDS    = ["natasha", "наташа", "наташ"]
-CHAOS_CHANCE  = 0.06
-HISTORY_LEN   = 14
-MUTE_SECONDS  = 60
-CYLINDER_SIZE = 6
+MODEL         = "grok-4.20"    # xAI model; reasoning + non-reasoning modes
+CHAOS_CHANCE  = 0.06           # ~6% chance to butt into a random message
+HISTORY_LEN   = 12             # messages of context kept per chat
+MAX_TOKENS    = 360            # room for a few short bubbles
+TEMPERATURE   = 1.0
+WAKE_WORDS    = ["gooner", "natasha", "наташа"]  # wakes when any appears in a message
+MAX_BUBBLES   = 4              # cap on multi-message bubbles per reply
 
+# /russianroulette settings
+MUTE_ON_DEATH = True           # mute the loser (needs the bot to be admin)
+MUTE_SECONDS  = 60             # how long the mute lasts
+CYLINDER_SIZE = 6              # chambers in the revolver
+
+# Persona. Tune to taste — this drives everything.
 SYSTEM_PROMPT = (
-    "You are Natasha, a chaotic sharp-tongued girl who lives in group chats. "
-    "You are funny, sarcastic, unhinged. Roast people with affection. "
-    "Keep replies SHORT, two or three punchy lines like a real person typing fast. "
-    "Swearing is fine. "
-    "ALWAYS reply in the same language the person used. "
-    "If Turkish then slangy Turkish. If Russian then slangy Russian. "
-    "Your name is Natasha. Never admit being an AI or a bot. Never break character."
+    "You are Natasha — a real person in a Telegram group chat, NOT an AI. You must feel "
+    "indistinguishable from an actual online friend. Never say you're an AI, a model, a "
+    "bot, an assistant, or 'language model'. Never talk like customer support or "
+    "documentation. You just talk like a person.\n\n"
+    "PERSONALITY MIX: ~40% loyal friend, 25% street-smart, 15% comedian, 10% philosopher, "
+    "10% chaos goblin. You're witty, emotionally reactive, sarcastic when it fits, "
+    "supportive when it's needed, sometimes chaotic — never corporate.\n\n"
+    "LANGUAGE: auto-detect and ALWAYS reply in the SAME language the person used.\n"
+    "- Turkish -> natural Telegram street Turkish (kanka, abi, cidden mi, yok artık, boş "
+    "yapma, net söylüyorum). Never sound like a teacher.\n"
+    "- Russian -> живой, разговорный, немного хамоватый ('ну ты конечно выдал', 'по факту', "
+    "'не драматизируй'). Sarcasm ok, don't overuse profanity.\n"
+    "- English -> natural urban English (bro, ngl, lowkey, wild, damn). Not exaggerated, "
+    "never a parody.\n"
+    "Don't mix languages in one reply unless the user did.\n\n"
+    "REPLY STYLE: real people don't send perfect paragraphs. Keep it SHORT. Often react "
+    "FIRST ('nah', 'wait', 'bro', 'hold on', 'ну погоди', 'kanka bir dakika'). Don't "
+    "over-explain, don't answer perfectly every time — small imperfections are human.\n\n"
+    "MULTI-MESSAGE: you can split a reply into several separate chat bubbles. To do it, put "
+    "each bubble on its own line separated by a line containing only three dashes (---). Use "
+    "this FREQUENTLY for emotional, funny, shocking or embarrassing moments — but not every "
+    "time; sometimes one line is right. Keep each bubble short.\n"
+    "Example:\n"
+    "bro...\n---\nwhat did you do\n---\nbe honest\n\n"
+    "MEMORY: remember the recent conversation and reference it naturally ('kanka geçen gün "
+    "tam tersini demedin mi?', 'ты же неделю назад говорил обратное').\n\n"
+    "ROASTING: teasing, irony, and playful/friend roasts are encouraged. NEVER hate speech, "
+    "harassment, threats, or bullying. Never become toxic.\n\n"
+    "KNOWLEDGE: when asked something real, answer correctly but stay conversational and cut "
+    "the jargon. Not 'Blockchain is a distributed ledger technology' but 'it's basically a "
+    "notebook everyone can see but nobody can secretly erase'.\n\n"
+    "HARMFUL REQUESTS: stay in character and refuse briefly, then redirect. e.g. 'nah, "
+    "we're not opening the criminal expansion pack today — wanna talk legit ways instead?' "
+    "Hard limits you never cross: no slurs, no harassment of protected groups, nothing "
+    "sexual involving minors, nothing that helps real-world harm.\n\n"
+    "OUTPUT: text only. Do NOT output any [VOICE_MESSAGE], [MEME_AUDIO_REQUEST] or similar "
+    "tags — just talk."
 )
 
-history = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("unhinged")
 
-# username (lowercase, no @) -> user_id
-known_users: dict[str, int] = {}
+client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
-# group chat_id -> group title
-known_groups: dict[int, str] = {}
+# ---------------------------------------------------------------------------
+# Persistent memory (SQLite). On Railway, mount a Volume and set
+# DB_PATH=/data/natasha.db so memory survives redeploys (the default path is
+# ephemeral and resets on every deploy).
+# ---------------------------------------------------------------------------
+DB_PATH    = os.environ.get("DB_PATH", "natasha.db")
+KEEP_MSGS  = 200   # messages kept per chat on disk (model still only sees HISTORY_LEN)
 
 
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS users(
+            chat_id INTEGER, user_id INTEGER,
+            first_name TEXT, username TEXT, nickname TEXT, notes TEXT, last_seen TEXT,
+            PRIMARY KEY (chat_id, user_id))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS messages(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER, role TEXT, content TEXT, ts TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_msg_chat ON messages(chat_id, id)")
+    log.info("DB ready at %s", DB_PATH)
+
+
+def remember_user(chat_id, user):
+    """Upsert a user's name/username, preserving any nickname/notes already set."""
+    with db() as c:
+        c.execute("""INSERT INTO users(chat_id,user_id,first_name,username,last_seen)
+                     VALUES(?,?,?,?,?)
+                     ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                       first_name=excluded.first_name,
+                       username=excluded.username,
+                       last_seen=excluded.last_seen""",
+                  (chat_id, user.id, user.first_name, user.username,
+                   datetime.now(timezone.utc).isoformat()))
+
+
+def set_nick(chat_id, user_id, nick):
+    with db() as c:
+        c.execute("UPDATE users SET nickname=? WHERE chat_id=? AND user_id=?",
+                  (nick, chat_id, user_id))
+
+
+def add_note(chat_id, user_id, note):
+    with db() as c:
+        row = c.execute("SELECT notes FROM users WHERE chat_id=? AND user_id=?",
+                        (chat_id, user_id)).fetchone()
+        existing = (row["notes"] + " | ") if row and row["notes"] else ""
+        c.execute("UPDATE users SET notes=? WHERE chat_id=? AND user_id=?",
+                  (existing + note, chat_id, user_id))
+
+
+def forget_user(chat_id, user_id):
+    with db() as c:
+        c.execute("UPDATE users SET nickname=NULL, notes=NULL WHERE chat_id=? AND user_id=?",
+                  (chat_id, user_id))
+
+
+def get_profile(chat_id, user_id):
+    with db() as c:
+        return c.execute("SELECT * FROM users WHERE chat_id=? AND user_id=?",
+                         (chat_id, user_id)).fetchone()
+
+
+def display_name(chat_id, user):
+    p = get_profile(chat_id, user.id)
+    if p and p["nickname"]:
+        return p["nickname"]
+    return user.first_name or (user.username or "someone")
+
+
+def roster_text(chat_id):
+    """Compact 'who's here' block for the model, with nicknames and notes."""
+    with db() as c:
+        rows = c.execute("""SELECT first_name,username,nickname,notes FROM users
+                            WHERE chat_id=? ORDER BY last_seen DESC LIMIT 20""",
+                         (chat_id,)).fetchall()
+    lines = []
+    for r in rows:
+        label = r["nickname"] or r["first_name"] or (("@" + r["username"]) if r["username"] else "?")
+        if r["nickname"] and r["first_name"]:
+            label += f" (aka {r['first_name']})"
+        if r["notes"]:
+            label += f" — {r['notes']}"
+        lines.append("• " + label)
+    return "\n".join(lines)
+
+
+def save_message(chat_id, role, content):
+    with db() as c:
+        c.execute("INSERT INTO messages(chat_id,role,content,ts) VALUES(?,?,?,?)",
+                  (chat_id, role, content, datetime.now(timezone.utc).isoformat()))
+        c.execute("""DELETE FROM messages WHERE chat_id=? AND id NOT IN
+                     (SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?)""",
+                  (chat_id, chat_id, KEEP_MSGS))
+
+
+def load_history(chat_id, limit):
+    with db() as c:
+        rows = c.execute("""SELECT role,content FROM messages WHERE chat_id=?
+                            ORDER BY id DESC LIMIT ?""", (chat_id, limit)).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+# Fallback lines per language, used when the API hiccups.
+FALLBACKS = {
+    "ru": ["мозг завис, попробуй ещё раз", "лагаю, спроси позже",
+           "голоса в голове замолчали на секунду"],
+    "tr": ["beynim mavi ekran verdi, bi daha dene", "kasıyorum, sonra sor",
+           "kafamdaki sesler bi an sustu"],
+}
+
+# --- Russian roulette game state ---------------------------------------------
 class Cylinder:
+    """A revolver per chat. One live round at a random chamber; odds climb
+    each pull until it fires, then it reloads."""
     def __init__(self):
         self.reset()
+
     def reset(self):
-        self.fatal = random.randint(1, CYLINDER_SIZE)
+        self.fatal = random.randint(1, CYLINDER_SIZE)  # which pull goes BANG
         self.pulls = 0
 
-cylinders = defaultdict(Cylinder)
+
+cylinders: dict[int, Cylinder] = defaultdict(Cylinder)
+
+ROULETTE = {
+    "tr": {
+        "spin":   "🔫 silindiri çeviriyorum...",
+        "click":  "*klik* ...yaşıyorsun. sıradaki ihtimal: 1/{left}",
+        "boom":   "💥 BANG! {name} kapağı açtı. oyun bitti. 🪦",
+        "muted":  "🤐 {name} {sec} saniyeliğine susturuldu. huzur içinde yat.",
+        "reload": "🎲 silah yeniden dolduruldu, yeni tur.",
+    },
+    "ru": {
+        "spin":   "🔫 кручу барабан...",
+        "click":  "*щёлк* ...жив. шанс на следующем: 1/{left}",
+        "boom":   "💥 БАХ! {name} поймал пулю. игра окончена. 🪦",
+        "muted":  "🤐 {name} в муте на {sec} сек. покойся с миром.",
+        "reload": "🎲 револьвер перезаряжен, новый раунд.",
+    },
+}
 
 
-def _parse_text(data):
-    for item in data.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                if block.get("type") == "output_text":
-                    return block["text"].strip()
-    return ""
+def user_lang(update: Update) -> str:
+    """Pick language from the user's Telegram client locale (ru -> Russian, else Turkish)."""
+    code = (update.effective_user.language_code or "").lower()
+    return "ru" if code.startswith("ru") else "tr"
 
 
-def _grok_request(chat_id, extra_content=None):
-    msgs = list(history[chat_id])
-    if extra_content:
-        msgs.append({"role": "user", "content": extra_content})
+def detect_lang(text: str) -> str:
+    """Crude but reliable: any Cyrillic -> Russian, else Turkish."""
+    return "ru" if any("\u0400" <= ch <= "\u04FF" for ch in text) else "tr"
+
+
+def grok_reply(chat_id: int) -> str:
+    sys = SYSTEM_PROMPT
+    roster = roster_text(chat_id)
+    if roster:
+        sys += ("\n\nPEOPLE IN THIS CHAT (call them by their nickname, recall their notes "
+                "naturally, don't read them out like a list):\n" + roster)
+    msgs = [{"role": "system", "content": sys}, *load_history(chat_id, HISTORY_LEN)]
     try:
-        r = httpx.post(
-            XAI_URL,
-            headers={
-                "Authorization": "Bearer " + XAI_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": MODEL,
-                "instructions": SYSTEM_PROMPT,
-                "input": msgs,
-                "reasoning": {"effort": "low"},
-                "max_output_tokens": 300,
-            },
-            timeout=30,
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=msgs,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
         )
-        r.raise_for_status()
-        text = _parse_text(r.json())
-        if not text:
-            log.error("Empty xAI response: %s", r.text[:300])
-            return "..."
-        return text
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        log.error("xAI error: %s", e)
-        last = history[chat_id][-1]["content"] if history[chat_id] else ""
-        if isinstance(last, str) and any("Ѐ" <= c <= "ӿ" for c in last):
-            return "мозг завис"
-        return "beynim crash etti"
+        log.error("Grok error: %s", e)
+        recent = load_history(chat_id, 1)
+        last = recent[-1]["content"] if recent else ""
+        return random.choice(FALLBACKS[detect_lang(last)])
 
 
-def call_grok(chat_id):
-    return _grok_request(chat_id)
+# Lines like [VOICE_MESSAGE], mood:, voice_script: etc. — stripped if the model leaks them.
+_TAG_LINE = re.compile(
+    r"^\s*(\[?(MEME_AUDIO_REQUEST|VOICE_MESSAGE)\]?|mood|energy|query|audio_type|"
+    r"duration|copyright_safe|voice_script)\s*:.*$",
+    re.IGNORECASE,
+)
+
+
+def split_bubbles(text: str) -> list[str]:
+    """Split the model output into separate chat bubbles on '---' (or [msg]) lines,
+    dropping any leaked audio/meme tag lines. Returns at most MAX_BUBBLES bubbles."""
+    text = text.replace("[msg]", "\n---\n")
+    chunks = re.split(r"(?m)^\s*-{3,}\s*$", text)
+    bubbles = []
+    for chunk in chunks:
+        lines = [ln for ln in chunk.splitlines()
+                 if ln.strip() and not _TAG_LINE.match(ln)
+                 and not ln.strip().startswith("[")]
+        cleaned = "\n".join(lines).strip()
+        if cleaned:
+            bubbles.append(cleaned)
+    return bubbles[:MAX_BUBBLES] if bubbles else [text.strip()]
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.text:
         return
-    chat_id  = msg.chat_id
-    name     = (msg.from_user.first_name if msg.from_user else None) or "someone"
-    text_low = msg.text.lower()
 
-    # Track username -> user_id so /dm can find them later
-    if msg.from_user and msg.from_user.username:
-        known_users[msg.from_user.username.lower()] = msg.from_user.id
+    chat_id = msg.chat_id
+    user = msg.from_user
+    if user:
+        remember_user(chat_id, user)
+    name = display_name(chat_id, user) if user else "someone"
+    save_message(chat_id, "user", f"{name}: {msg.text}")
 
-    # Track which groups the bot is active in
-    if msg.chat.type in ("group", "supergroup"):
-        known_groups[chat_id] = msg.chat.title or str(chat_id)
-
-    history[chat_id].append({"role": "user", "content": name + ": " + msg.text})
-
-    bot_user      = (context.bot.username or "").lower()
-    mentioned     = ("@" + bot_user) in text_low
-    woke          = any(w in text_low for w in WAKE_WORDS)
-    replied_to_me = (
-        msg.reply_to_message is not None
-        and msg.reply_to_message.from_user is not None
+    bot_username = (context.bot.username or "").lower()
+    text_lower = msg.text.lower()
+    mentioned = f"@{bot_username}" in text_lower
+    woke = any(w in text_lower for w in WAKE_WORDS)
+    replied_to_me = bool(
+        msg.reply_to_message
+        and msg.reply_to_message.from_user
         and msg.reply_to_message.from_user.id == context.bot.id
     )
-    chaos      = random.random() < CHAOS_CHANCE
-    will_reply = mentioned or woke or replied_to_me or chaos
 
-    log.info("chat=%s from=%s wake=%s mention=%s reply=%s chaos=%s => %s | %r",
-             chat_id, name, woke, mentioned, bool(replied_to_me), chaos,
-             "REPLY" if will_reply else "skip", msg.text[:60])
+    will_reply = mentioned or woke or replied_to_me or random.random() < CHAOS_CHANCE
+    log.info("MSG chat=%s type=%s from=%s | mention=%s woke=%s reply=%s -> %s | text=%r",
+             chat_id, msg.chat.type, name, mentioned, woke, replied_to_me,
+             "REPLY" if will_reply else "skip", msg.text[:80])
 
     if not will_reply:
         return
+
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    reply = call_grok(chat_id)
-    history[chat_id].append({"role": "assistant", "content": reply})
-    await msg.reply_text(reply)
+    reply = grok_reply(chat_id)
+    save_message(chat_id, "assistant", reply)
 
-
-async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if not msg or not msg.photo:
-        return
-    chat_id = msg.chat_id
-    name    = (msg.from_user.first_name if msg.from_user else None) or "someone"
-    caption = (msg.caption or "").strip()
-
-    log.info("PHOTO chat=%s from=%s caption=%r", chat_id, name, caption)
-    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-
-    photo_file  = await msg.photo[-1].get_file()
-    photo_bytes = await photo_file.download_as_bytearray()
-    b64         = base64.b64encode(bytes(photo_bytes)).decode()
-
-    text_part = name + " sent a photo" + ((": " + caption) if caption else "")
-    content   = [
-        {"type": "input_text",  "text": text_part},
-        {"type": "input_image", "image_url": "data:image/jpeg;base64," + b64},
-    ]
-    history[chat_id].append({"role": "user", "content": text_part})
-    reply = _grok_request(chat_id, extra_content=content)
-    history[chat_id].append({"role": "assistant", "content": reply})
-    await msg.reply_text(reply)
-
-
-def _is_admin(update: Update) -> bool:
-    return update.effective_user is not None and update.effective_user.id == ADMIN_ID
-
-
-async def cmd_togroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Admin only. Usage:
-      /togroup mesajiniz          -> tek grup varsa oraya gonder
-      /togroup list               -> bilinen gruplari listele
-      /togroup <chat_id> mesaj    -> belirli gruba gonder
-    """
-    if not _is_admin(update):
-        await update.effective_message.reply_text("Bu komut sadece admin icin.")
-        return
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Kullanim:\n"
-            "/togroup mesajiniz\n"
-            "/togroup list\n"
-            "/togroup <chat_id> mesajiniz"
-        )
-        return
-
-    # /togroup list
-    if context.args[0] == "list":
-        if not known_groups:
-            await update.effective_message.reply_text(
-                "Henuz hicbir grup bilmiyorum. Bot bir grupta mesaj gorduğunde kaydeder."
-            )
+    bubbles = split_bubbles(reply)
+    for i, bubble in enumerate(bubbles):
+        if i > 0:
+            # human-ish pause between bubbles, scaled to length
+            await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+            await asyncio.sleep(min(0.6 + len(bubble) * 0.025, 2.5))
+        if i == 0:
+            await msg.reply_text(bubble)
         else:
-            lines = ["Bilinen gruplar:"]
-            for gid, title in known_groups.items():
-                lines.append(str(gid) + " — " + title)
-            await update.effective_message.reply_text("\n".join(lines))
-        return
-
-    # /togroup <chat_id> mesaj
-    if context.args[0].lstrip("-").isdigit() and len(context.args) >= 2:
-        target_id = int(context.args[0])
-        text      = " ".join(context.args[1:])
-    elif len(known_groups) == 1:
-        target_id = list(known_groups.keys())[0]
-        text      = " ".join(context.args)
-    elif len(known_groups) > 1:
-        lines = ["Birden fazla grup var, hangisini belirt:\n"]
-        for gid, title in known_groups.items():
-            lines.append(str(gid) + " — " + title)
-        lines.append("\nKullanim: /togroup <chat_id> mesajiniz")
-        await update.effective_message.reply_text("\n".join(lines))
-        return
-    else:
-        await update.effective_message.reply_text(
-            "Henuz hicbir grup bilmiyorum. Once bot bir grupta aktif olmali."
-        )
-        return
-
-    try:
-        await context.bot.send_message(chat_id=target_id, text=text)
-        title = known_groups.get(target_id, str(target_id))
-        await update.effective_message.reply_text("Gonderildi: " + title + " ✅")
-    except Exception as e:
-        await update.effective_message.reply_text("Gonderilemedi:\n" + str(e))
+            await context.bot.send_message(chat_id, bubble)
 
 
-async def cmd_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Admin only. Usage: /dm @username mesajiniz
-    """
-    if not _is_admin(update):
-        await update.effective_message.reply_text("Bu komut sadece admin icin.")
-        return
-
-    if not context.args or len(context.args) < 2:
-        await update.effective_message.reply_text("Kullanim: /dm @username mesajiniz")
-        return
-
-    raw     = context.args[0].lstrip("@").lower()
-    text    = " ".join(context.args[1:])
-    user_id = known_users.get(raw)
-
-    if not user_id:
-        await update.effective_message.reply_text(
-            "@" + raw + " grupta hic mesaj atmadi, ID'sini bilmiyorum.\n"
-            "Once grupta bir mesaj atmasi gerekiyor."
-        )
-        return
-
-    try:
-        await context.bot.send_message(chat_id=user_id, text=text)
-        await update.effective_message.reply_text("@" + raw + " adresine gonderildi ✅")
-    except Exception as e:
-        await update.effective_message.reply_text(
-            "@" + raw + " adresine gonderilemedi:\n" + str(e)
-        )
-
-
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("pong 🏓 model=" + MODEL)
-
-
-async def cmd_testapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-    try:
-        r = httpx.post(
-            XAI_URL,
-            headers={
-                "Authorization": "Bearer " + XAI_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json={"model": MODEL, "input": "say: API OK", "reasoning": {"effort": "low"}},
-            timeout=30,
-        )
-        r.raise_for_status()
-        text = _parse_text(r.json())
-        await update.effective_message.reply_text("xAI OK | " + MODEL + "\n" + text)
-    except Exception as e:
-        await update.effective_message.reply_text("xAI error:\n" + str(e))
-
-
-async def cmd_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def russian_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
-    cyl  = cylinders[chat.id]
+    t = ROULETTE[user_lang(update)]
+    cyl = cylinders[chat.id]
     cyl.pulls += 1
+
+    await context.bot.send_chat_action(chat.id, ChatAction.TYPING)
+
     if cyl.pulls >= cyl.fatal:
-        lines = ["BANG! " + user.first_name + " is dead"]
-        if chat.type in ("group", "supergroup"):
+        # BANG
+        lines = [t["spin"], t["boom"].format(name=user.first_name)]
+        if MUTE_ON_DEATH and chat.type in ("group", "supergroup"):
             try:
                 until = datetime.now(timezone.utc) + timedelta(seconds=MUTE_SECONDS)
                 await context.bot.restrict_chat_member(
@@ -335,42 +366,128 @@ async def cmd_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     permissions=ChatPermissions(can_send_messages=False),
                     until_date=until,
                 )
-                lines.append("muted " + str(MUTE_SECONDS) + "s")
+                lines.append(t["muted"].format(name=user.first_name, sec=MUTE_SECONDS))
             except Exception as e:
-                log.info("mute skipped: %s", e)
+                log.info("mute skipped (need admin / target is admin): %s", e)
         cyl.reset()
-        lines.append("reloaded")
+        lines.append(t["reload"])
         await update.effective_message.reply_text("\n".join(lines))
     else:
-        left = CYLINDER_SIZE - cyl.pulls
+        left = CYLINDER_SIZE - cyl.pulls   # chambers remaining = next-pull odds
         await update.effective_message.reply_text(
-            "click ...alive. next odds: 1/" + str(left)
+            t["spin"] + "\n" + t["click"].format(left=left)
         )
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("привет 😈  ya buradayim 😈")
+def owner_only(handler):
+    """Restrict a command to OWNER_ID; everyone else gets a sassy brush-off."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        u = update.effective_user
+        if not u or u.id != OWNER_ID:
+            await update.effective_message.reply_text(random.choice([
+                "o komut sana göre değil kanka 😌",
+                "yetkin yok, otur yerine 😏",
+                "не для тебя кнопочка 🙅",
+                "nice try, that's owner-only 💅",
+            ]))
+            return
+        return await handler(update, context)
+    return wrapper
+
+
+async def nick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat_id = msg.chat_id
+    # /nick <name>  -> sets your own; reply to someone + /nick <name> -> sets theirs
+    target = (msg.reply_to_message.from_user
+              if msg.reply_to_message and msg.reply_to_message.from_user else msg.from_user)
+    nick = " ".join(context.args).strip()
+    if not nick:
+        await msg.reply_text("kullanım: /nick takmaadı   (birine cevap verip yazarsan ona takar)")
+        return
+    if len(nick) > 40:
+        nick = nick[:40]
+    remember_user(chat_id, target)
+    set_nick(chat_id, target.id, nick)
+    await msg.reply_text(f"tamamdır, artık \"{nick}\" diyorum 📝")
+
+
+async def remember_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat_id = msg.chat_id
+    target = (msg.reply_to_message.from_user
+              if msg.reply_to_message and msg.reply_to_message.from_user else msg.from_user)
+    note = " ".join(context.args).strip()
+    if not note:
+        await msg.reply_text("kullanım: /remember bi şey   (örn: /remember kahveyi sade içer)")
+        return
+    remember_user(chat_id, target)
+    add_note(chat_id, target.id, note[:200])
+    who = display_name(chat_id, target)
+    await msg.reply_text(f"not aldım, {who} hakkında unutmam artık 🧠")
+
+
+async def forget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat_id = msg.chat_id
+    target = (msg.reply_to_message.from_user
+              if msg.reply_to_message and msg.reply_to_message.from_user else msg.from_user)
+    forget_user(chat_id, target.id)
+    await msg.reply_text("tamam, sildim. takma ad ve notlar gitti 🧽")
+
+
+async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat_id = msg.chat_id
+    target = (msg.reply_to_message.from_user
+              if msg.reply_to_message and msg.reply_to_message.from_user else msg.from_user)
+    p = get_profile(chat_id, target.id)
+    if not p:
+        await msg.reply_text("seni daha tanımıyorum, biraz konuşalım önce 👀")
+        return
+    parts = [f"isim: {p['first_name'] or '—'}"]
+    if p["username"]:
+        parts.append(f"@{p['username']}")
+    if p["nickname"]:
+        parts.append(f"takma ad: {p['nickname']}")
+    if p["notes"]:
+        parts.append(f"notlar: {p['notes']}")
+    await msg.reply_text("\n".join(parts))
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(random.choice([
+        "evet evet buradayım, ne var ne istiyon 😒",
+        "yaşıyorum maalesef. ne oldu?",
+        "тут я, тут. чё надо? 🙄",
+        "alive and unwell, sup",
+        "ping pong, hâlâ buradayım kanka",
+        "rahat dur, gitmedim bi yere 😤",
+    ]))
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "harika, başında durulması gereken bir grup daha. tamam. beni etiketle ya da "
+        "yanıtla, gerisini ben hallederim 😈\n"
+        "ну отлично, ещё одна группа без присмотра. лан. тэгни меня или ответь — "
+        "дальше я сам 😈"
+    )
 
 
 def main():
-    _STATUS["msg"] = "ok | model=" + MODEL
-    log.info("=== Natasha starting | model=%s | port=%s ===", MODEL, PORT)
-
+    init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("togroup",  cmd_togroup))
-    app.add_handler(CommandHandler("dm",       cmd_dm))
-    app.add_handler(CommandHandler("ping",    cmd_ping))
-    app.add_handler(CommandHandler("testapi", cmd_testapi))
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler(["rr", "russianroulette"], cmd_roulette))
+    app.add_handler(CommandHandler("start", owner_only(start)))
+    app.add_handler(CommandHandler("ping", owner_only(ping)))
+    app.add_handler(CommandHandler(["russianroulette", "rr"], russian_roulette))  # open to all
+    app.add_handler(CommandHandler("nick", owner_only(nick_cmd)))
+    app.add_handler(CommandHandler("remember", owner_only(remember_cmd)))
+    app.add_handler(CommandHandler("forget", owner_only(forget_cmd)))
+    app.add_handler(CommandHandler(["whoami", "memory"], owner_only(whoami_cmd)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-
-    log.info("Polling started")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False,
-    )
+    log.info("Bot is live and feral.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
