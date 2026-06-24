@@ -1,28 +1,32 @@
 # Natasha Telegram Group Bot
 
-Natasha is an xAI Grok-powered Telegram group bot built for lively group chats. It replies like a regular chat member, remembers lightweight context, understands photos, and can drop GIFs, Imgflip meme templates, and MyInstants voice-note reactions when the conversation calls for it.
+**Natasha** is a Grok-powered Telegram group bot for chaotic, multilingual group chats. She replies like a real chat member, remembers lightweight context, reacts to photos, and can drop GIFs, Imgflip meme templates, and MyInstants voice-note sounds without needing slash commands.
+
+![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=flat-square&logo=telegram&logoColor=white)
+![Grok](https://img.shields.io/badge/xAI-Grok-111111?style=flat-square)
+![SQLite](https://img.shields.io/badge/Memory-SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white)
 
 ```text
-Telegram group -> Natasha -> Grok reply -> optional GIF / meme / voice reaction
+Group chat -> Natasha -> Grok reply -> text + optional GIF / meme / voice reaction
 ```
 
-## Highlights
+## What It Does
 
-| Area | What Natasha Does |
+| Capability | Details |
 | --- | --- |
-| Conversation | Short, natural replies in Turkish, Russian, or English |
-| Triggers | Replies when mentioned, replied to, woken by keywords, or by chaos chance |
-| Memory | Stores recent chat context, nicknames, and owner-written notes in SQLite |
-| Photos | Sends images to Grok vision and reacts in character |
-| Media | Uses Tenor GIFs, Imgflip meme templates, and MyInstants voice sounds |
-| Commands | Owner memory tools plus a public Russian roulette mini-game |
+| Natural replies | Short, casual replies in Turkish, Russian, or English |
+| Smart triggers | Responds to mentions, replies, wake words, and occasional chaos |
+| Memory | Keeps recent context, nicknames, and notes in SQLite |
+| Vision | Reacts to photos with Grok vision |
+| GIFs | Uses Tenor when `TENOR_API_KEY` is set |
+| Memes | Finds matching Imgflip meme templates from the chat context |
+| Voice sounds | Downloads MyInstants sounds and sends them as Telegram voice notes |
+| Mini-game | Includes a public Russian roulette command |
 
 ## Quick Start
 
-1. Create a Telegram bot with BotFather.
-2. Disable privacy mode in BotFather if the bot should read all group messages.
-3. Get an xAI API key.
-4. Install dependencies and run the bot.
+Create a bot with BotFather, disable privacy mode if she should read group chatter, then run:
 
 ```bash
 pip install -r requirements.txt
@@ -33,7 +37,7 @@ export XAI_API_KEY="your-xai-api-key"
 python natasha_bot.py
 ```
 
-Natasha uses Telegram polling, so you do not need a webhook or public URL for local use.
+Natasha uses Telegram polling, so local development does not need a webhook or public URL.
 
 ## Configuration
 
@@ -41,15 +45,23 @@ Natasha uses Telegram polling, so you do not need a webhook or public URL for lo
 | --- | --- | --- | --- |
 | `TELEGRAM_TOKEN` | Yes | none | Telegram bot token from BotFather |
 | `XAI_API_KEY` | Yes | none | xAI API key for Grok |
-| `OWNER_ID` | No | `1346274959` | Telegram user ID allowed to run owner-only commands |
-| `DB_PATH` | No | `natasha.db` | SQLite database path |
+| `DB_PATH` | No | `natasha.db` | SQLite database location |
 | `TENOR_API_KEY` | No | empty | Enables Tenor GIF reactions |
+| `OWNER_ID` | No | not set | Set this yourself to enable owner tools |
 
-Imgflip and MyInstants do not need API keys. They are scraped from public pages, so those integrations are best-effort.
+Imgflip meme templates and MyInstants sounds use public pages and do not require API keys.
+
+To enable owner tools, set your own Telegram user ID:
+
+```bash
+export OWNER_ID="x"
+```
+
+Replace `x` with your actual numeric Telegram user ID. Natasha does not include a hardcoded owner ID.
 
 ## Media Reactions
 
-Grok is instructed to use hidden media tags when a reaction fits. The bot removes these tags from the visible text, downloads the media, and sends it to the chat.
+Grok can emit hidden media tags. Natasha removes the tag from the visible reply, downloads the matching media, and sends it to the chat.
 
 ```text
 [gif: facepalm]
@@ -60,13 +72,18 @@ Grok is instructed to use hidden media tags when a reaction fits. The bot remove
 [sound: en | airhorn]
 ```
 
-Language hints can be `tr`, `ru`, or `en`. If Grok omits the language, Natasha infers it from the reply.
+Rules:
 
-Sound reactions are downloaded from MyInstants as MP3 files. When `ffmpeg` is available, Natasha converts them to OGG/Opus and sends them as Telegram voice notes. If conversion fails, it falls back to normal audio.
+- `tr`, `ru`, and `en` help match the chat language.
+- If Grok omits the language, Natasha infers it from the reply.
+- Meme searches are based on the current chat, image, joke, or direct user request.
+- If no matching meme template exists, Natasha skips it instead of sending a random unrelated meme.
+- MyInstants MP3 files are converted to OGG/Opus voice notes when `ffmpeg` is available.
+- If voice conversion fails, Natasha falls back to regular Telegram audio.
 
 ## Commands
 
-Owner-only commands:
+Owner tools:
 
 ```text
 /start
@@ -85,40 +102,40 @@ Public commands:
 /rr
 ```
 
-Russian roulette mute behavior requires the bot to be an admin in the group.
+Roulette mute behavior requires Natasha to be an admin in the group.
 
-## Deployment
+## Deploy
 
-This repo is ready for Railway-style deployment:
+The repo includes deployment files for Railway-style hosts:
 
-| File | Purpose |
+| File | Role |
 | --- | --- |
-| `Procfile` | Starts the bot with `python natasha_bot.py` |
-| `nixpacks.toml` | Installs Python, `ffmpeg`, Python dependencies, then starts the bot |
-| `requirements.txt` | Python packages needed at runtime |
+| `Procfile` | Runs `python natasha_bot.py` |
+| `nixpacks.toml` | Installs Python, `ffmpeg`, dependencies, and starts the bot |
+| `requirements.txt` | Python runtime dependencies |
 
-For persistent memory on Railway, mount a volume and set:
+For persistent memory, mount a volume and set:
 
 ```bash
 DB_PATH=/data/natasha.db
 ```
 
-After changing dependencies, make sure the latest commit is pushed and the service is rebuilt. If deployment logs show `ModuleNotFoundError: No module named 'requests'`, the deployed revision does not include the current `requirements.txt` or did not rebuild dependencies.
+After dependency changes, push the latest commits and force a clean rebuild. If logs show `ModuleNotFoundError: No module named 'requests'`, the deployed revision is stale or dependencies were not rebuilt.
 
-## Project Layout
+## Project Structure
 
 ```text
 .
 ├── natasha_bot.py      # bot logic, Grok calls, media scraping, commands
 ├── requirements.txt    # Python dependencies
-├── nixpacks.toml       # Railway/Nixpacks build and start config
-├── Procfile            # process start command
+├── nixpacks.toml       # Nixpacks build/start config
+├── Procfile            # process command
 └── LICENSE
 ```
 
 ## Notes
 
-- Keep Telegram privacy mode disabled if Natasha should react to regular group chatter.
-- Media scraping can break if Imgflip or MyInstants changes page markup.
-- Tenor GIFs require `TENOR_API_KEY`; memes and sounds do not require keys.
-- The bot stores local SQLite memory. Use a persistent `DB_PATH` in production.
+- Disable Telegram privacy mode if Natasha should read regular group messages.
+- Give Natasha admin rights if roulette mute behavior should work.
+- Imgflip and MyInstants scraping is best-effort and may need updates if their HTML changes.
+- Use a persistent `DB_PATH` in production so memory survives redeploys.

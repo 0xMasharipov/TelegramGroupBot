@@ -43,7 +43,19 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 # ---------------------------------------------------------------------------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 XAI_API_KEY    = os.environ["XAI_API_KEY"]
-OWNER_ID       = int(os.environ.get("OWNER_ID", "1346274959"))  # only this user may run commands
+
+
+def optional_int_env(name: str):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError as e:
+        raise RuntimeError(f"{name} must be a numeric Telegram user ID") from e
+
+
+OWNER_ID       = optional_int_env("OWNER_ID")  # set to enable owner-only commands
 
 # Optional media modules — each works only if its key is set (otherwise skipped).
 TENOR_API_KEY     = os.environ.get("TENOR_API_KEY", "")       # GIF/meme reactions (tenor.googleapis.com)
@@ -112,6 +124,8 @@ SYSTEM_PROMPT = (
     "- To react with a MyInstants sound effect, add a line: [sound: lang | short search terms] "
     "(e.g. [sound: tr | bass boosted], [sound: ru | bruh], [sound: en | airhorn]).\n"
     "Use lang as tr, ru, or en to match the chat language. You may omit lang only if obvious. "
+    "Meme template hints MUST come from the current chat context, joke, image, or the user's "
+    "specific request. Never choose a random meme template just to send something. "
     "Keep sound search terms and meme template hints simple. Put the tag "
     "on its own line. Most messages have NO tag. Never use more than one of each per reply.\n"
     "If the user asks you to send/drop/find a meme, sound, audio, voice, ses, or instant, "
@@ -412,7 +426,32 @@ def parse_media_spec(spec: str, default_lang: str = "en"):
     return default_lang, spec.strip()
 
 
-def requested_media_from_user(text: str, default_lang: str):
+_MEDIA_QUERY_STOPWORDS = {
+    "send", "drop", "find", "show", "give", "play", "meme", "mem", "caps", "sound",
+    "voice", "audio", "instant", "myinstants", "gonder", "gönder", "yolla", "ver",
+    "bul", "cal", "çal", "ses", "sesi", "sesli", "at", "kanka", "abi", "ya", "bir",
+    "the", "and", "for", "you", "that", "this", "with", "from", "not", "but", "just",
+    "chat", "template", "random", "unrelated", "according", "скинь", "отправь", "найди",
+    "дай", "покажи", "звук", "войс", "аудио",
+}
+
+
+def chat_context_query(chat_id: int, limit: int = 8):
+    """Build a short non-random media query from recent chat words."""
+    recent = load_history(chat_id, limit)
+    words = []
+    for msg in reversed(recent):
+        content = re.sub(r"^\s*[^:]{1,40}:\s*", "", msg["content"])
+        content = re.sub(r"\[[^\]]+\]", " ", content)
+        for word in re.findall(r"[\w\u0400-\u04FFçğıöşüÇĞİÖŞÜ]{3,}", content.lower()):
+            if word not in _MEDIA_QUERY_STOPWORDS and not word.isdigit():
+                words.append(word)
+        if len(words) >= 4:
+            break
+    return " ".join(words[:4])
+
+
+def requested_media_from_user(text: str, default_lang: str, chat_id: int | None = None):
     """Infer a direct media request when Grok forgot to emit a media tag."""
     lowered = text.lower()
     action_words = (
@@ -436,7 +475,11 @@ def requested_media_from_user(text: str, default_lang: str):
         " ",
         text,
     )
-    query = re.sub(r"\s+", " ", cleaned).strip(" .,!?:;-") or text.strip()
+    query = re.sub(r"\s+", " ", cleaned).strip(" .,!?:;-")
+    if not query and chat_id is not None:
+        query = chat_context_query(chat_id)
+    if not query:
+        return None, None
     spec = f"{default_lang} | {query}"
     return (spec if asks_meme else None), (spec if asks_sound else None)
 
@@ -490,22 +533,27 @@ def _best_title_match(items, query: str):
     if not items:
         return None
     q = query.lower().strip()
-    if q:
-        for item in items:
-            if q in item["title"].lower():
-                return item
-        words = [w for w in re.split(r"\W+", q) if len(w) > 2]
-        if words:
-            scored = []
-            for item in items:
-                title = item["title"].lower()
-                score = sum(1 for word in words if word in title)
-                if score:
-                    scored.append((score, item))
-            if scored:
-                scored.sort(key=lambda pair: pair[0], reverse=True)
-                return scored[0][1]
-    return random.choice(items)
+    if not q:
+        return None
+    for item in items:
+        if q in item["title"].lower():
+            return item
+    words = [
+        w for w in re.split(r"\W+", q)
+        if len(w) > 3 and w not in _MEDIA_QUERY_STOPWORDS
+    ]
+    if not words:
+        return None
+    scored = []
+    for item in items:
+        title = item["title"].lower()
+        score = sum(1 for word in words if word in title)
+        if score:
+            scored.append((score, item))
+    if scored:
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return scored[0][1]
+    return None
 
 
 def imgflip_template_candidates():
@@ -813,7 +861,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text, gif_q, meme_q, snd_q = extract_media(reply)
     lang_hint = media_lang(text or reply)
-    fallback_meme_q, fallback_snd_q = requested_media_from_user(msg.text, lang_hint)
+    fallback_meme_q, fallback_snd_q = requested_media_from_user(msg.text, lang_hint, chat_id)
     meme_q = meme_q or fallback_meme_q
     snd_q = snd_q or fallback_snd_q
     bubbles = split_bubbles(text) if text else []
@@ -868,7 +916,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text, gif_q, meme_q, snd_q = extract_media(reply)
     lang_hint = media_lang(text or reply)
-    fallback_meme_q, fallback_snd_q = requested_media_from_user(caption, lang_hint)
+    fallback_meme_q, fallback_snd_q = requested_media_from_user(caption, lang_hint, chat_id)
     meme_q = meme_q or fallback_meme_q
     snd_q = snd_q or fallback_snd_q
     for i, bubble in enumerate(split_bubbles(text) if text else []):
@@ -913,9 +961,12 @@ async def russian_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def owner_only(handler):
-    """Restrict a command to OWNER_ID; everyone else gets a sassy brush-off."""
+    """Restrict a command to OWNER_ID; disabled when OWNER_ID is not configured."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u = update.effective_user
+        if OWNER_ID is None:
+            await update.effective_message.reply_text("owner komutları kapalı, OWNER_ID ayarlı değil")
+            return
         if not u or u.id != OWNER_ID:
             await update.effective_message.reply_text(random.choice([
                 "o komut sana göre değil kanka 😌",
