@@ -1,4 +1,4 @@
-![Natasha Telegram Group Bot banner](/natasha_readme_banner.png)
+![Natasha Telegram Group Bot banner](assets/natasha_readme_banner.png)
 
 # Natasha Telegram Group Bot
 
@@ -51,6 +51,9 @@ Natasha uses Telegram polling, so local development does not need a webhook or p
 | `TENOR_API_KEY` | No | empty | Enables Tenor GIF reactions |
 | `OWNER_ID` | No | not set | Set this yourself to enable owner tools |
 | `PERSONA_UTC_OFFSET_HOURS` | No | `3` | Local time offset for day/night persona photos |
+| `IMAGE_MODEL` | No | `grok-imagine-image-quality` | xAI Imagine model for generated Natasha photos |
+| `IMAGE_ASPECT_RATIO` | No | `1:1` | Aspect ratio for generated Natasha photos |
+| `IMAGE_RESOLUTION` | No | `1k` | Image resolution, usually `1k` or `2k` |
 
 Imgflip meme templates and MyInstants sounds use public pages and do not require API keys.
 
@@ -84,9 +87,13 @@ Rules:
 - MyInstants MP3 files are converted to OGG/Opus voice notes when `ffmpeg` is available.
 - If voice conversion fails, Natasha falls back to regular Telegram audio.
 
-## Persona Photos
+## Generated Images
 
-When a user asks Natasha to send her photo, selfie, avatar, or picture, she sends a deployable avatar asset instead of describing it in text. The bot chooses the variant by local time:
+When a user asks Natasha to create, draw, generate, or send an image, she generates a new Grok Imagine image from the user's message and sends it directly to the Telegram chat. If the request refers to recent chat context, Natasha includes nearby messages in the image prompt so the generated image follows what the user meant.
+
+When the request is specifically for Natasha's photo, selfie, avatar, or picture, the prompt keeps Natasha's base identity consistent while applying the user's requested pose, setting, safe outfit variation, time of day, or mood.
+
+The bot asks xAI for base64 image output and uploads those bytes to Telegram immediately. If a Natasha persona image generation fails, it falls back to a deployable avatar asset chosen by local time:
 
 | Time | Asset |
 | --- | --- |

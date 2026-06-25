@@ -519,39 +519,60 @@ def requested_media_from_user(text: str, default_lang: str, chat_id: int | None 
     return (spec if asks_meme else None), (spec if asks_sound else None)
 
 
+def has_keyword(text: str, words, *, exact_short: bool = False):
+    lowered = text.lower()
+    for word in words:
+        if exact_short and len(word) <= 3:
+            if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", lowered):
+                return True
+        elif word in lowered:
+            return True
+    return False
+
+
+IMAGE_WORDS = (
+    "image", "photo", "picture", "pic", "selfie", "avatar", "drawing", "draw",
+    "foto", "fotoğraf", "fotograf", "resim", "görsel", "gorsel",
+    "фото", "селфи", "аватар", "лицо", "картин", "рисунок",
+)
+IMAGE_ACTION_WORDS = (
+    "send", "show", "drop", "give", "generate", "draw", "create", "make",
+    "at", "çek", "ceker", "çeker", "gönder", "yolla", "göstersene",
+    "goster", "göster", "oluştur", "olustur", "yarat", "çiz", "ciz",
+    "скинь", "отправь", "покажи", "дай", "сгенерируй", "нарисуй", "создай",
+)
+
+
 def wants_persona_photo(text: str) -> bool:
     lowered = text.lower()
-
-    def has_keyword(words, *, exact_short: bool = False):
-        for word in words:
-            if exact_short and len(word) <= 3:
-                if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", lowered):
-                    return True
-            elif word in lowered:
-                return True
-        return False
-
-    photo_words = (
-        "photo", "picture", "pic", "selfie", "avatar", "face", "look", "image",
-        "foto", "fotoğraf", "fotograf", "resim", "görsel", "gorsel", "avatarını",
-        "fotoğrafını", "fotografını", "resmini", "фото", "селфи", "аватар",
-        "лицо", "картин",
-    )
-    action_words = (
-        "send", "show", "drop", "give", "generate", "draw", "create", "make",
-        "at", "çek", "ceker", "çeker", "gönder", "yolla", "göstersene",
-        "goster", "göster", "oluştur", "olustur", "yarat", "çiz", "ciz",
-        "скинь", "отправь", "покажи", "дай", "сгенерируй", "нарисуй", "создай",
-    )
     self_words = (
         "your", "ur", "you", "natasha", "senin", "kendini", "kendi",
         "сво", "тво", "наташа",
     )
-    has_photo = has_keyword(photo_words)
-    has_action = has_keyword(action_words, exact_short=True)
-    has_persona = has_keyword(self_words, exact_short=True)
+    persona_image_words = IMAGE_WORDS + (
+        "face", "look", "avatarını", "fotoğrafını", "fotografını", "resmini",
+    )
+    has_photo = has_keyword(text, persona_image_words)
+    has_action = has_keyword(text, IMAGE_ACTION_WORDS, exact_short=True)
+    has_persona = has_keyword(text, self_words, exact_short=True)
     compact_selfie_request = ("selfie" in lowered or "селфи" in lowered) and has_persona
     return has_photo and has_persona and (has_action or compact_selfie_request)
+
+
+def wants_generated_image(text: str) -> bool:
+    lowered = text.lower()
+    direct_phrases = (
+        "generate image", "generate an image", "create image", "create an image",
+        "make image", "make an image", "draw me", "draw a", "draw an",
+        "resim oluştur", "resim olustur", "resim yap", "görsel oluştur",
+        "gorsel olustur", "fotoğraf oluştur", "fotograf olustur", "çiz",
+        "ciz", "сгенерируй", "нарисуй", "создай картин",
+    )
+    asks_directly = any(phrase in lowered for phrase in direct_phrases)
+    return asks_directly or (
+        has_keyword(text, IMAGE_ACTION_WORDS, exact_short=True)
+        and has_keyword(text, IMAGE_WORDS)
+    )
 
 
 def wants_persona_imagine_prompt(text: str) -> bool:
@@ -596,20 +617,26 @@ def persona_caption(lang: str, period: str):
     return captions.get(lang, captions["en"])[period]
 
 
-async def send_persona_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
+async def send_generated_image(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
     msg = update.effective_message
     chat_id = msg.chat_id
     period = persona_period()
-    prompt = persona_generation_prompt(msg.text, period)
+    persona_request = wants_persona_photo(msg.text)
+    prompt = image_generation_prompt(msg.text, chat_id, period, persona_request)
 
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
-    image = generate_persona_image(prompt)
+    image = generate_image(prompt)
     if image:
-        await msg.reply_photo(photo=BytesIO(image), caption=persona_caption(lang, period))
-        save_message(chat_id, "assistant", f"[generated Natasha {period} persona photo]")
+        caption = persona_caption(lang, period) if persona_request else generated_image_caption(lang)
+        await msg.reply_photo(photo=BytesIO(image), caption=caption)
+        save_message(chat_id, "assistant", "[generated image from user request]")
         return
 
-    log.warning("persona image generation failed; falling back to local asset")
+    if not persona_request:
+        await msg.reply_text(random.choice(FALLBACKS.get(lang, FALLBACKS["tr"])))
+        return
+
+    log.warning("image generation failed; falling back to local persona asset")
     path = PERSONA_IMAGES[period]
     if not os.path.exists(path):
         log.warning("persona image missing: %s", path)
@@ -619,6 +646,10 @@ async def send_persona_photo(update: Update, context: ContextTypes.DEFAULT_TYPE,
     with open(path, "rb") as photo:
         await msg.reply_photo(photo=photo, caption=persona_caption(lang, period))
     save_message(chat_id, "assistant", f"[sent Natasha {period} persona photo]")
+
+
+async def send_persona_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
+    await send_generated_image(update, context, lang)
 
 
 async def send_persona_imagine_prompt(update: Update, lang: str):
@@ -642,18 +673,52 @@ def _download_bytes(url: str, headers: dict | None = None):
     return r.content
 
 
-def persona_generation_prompt(user_text: str, period: str):
+def generated_image_caption(lang: str):
+    captions = {
+        "tr": "al kanka",
+        "ru": "держи",
+        "en": "here",
+    }
+    return captions.get(lang, captions["en"])
+
+
+def image_context(chat_id: int, limit: int = 6):
+    recent = load_history(chat_id, limit)
+    lines = []
+    for msg in recent:
+        content = re.sub(r"\s+", " ", msg["content"]).strip()
+        if content:
+            lines.append(f"{msg['role']}: {content[:240]}")
+    return "\n".join(lines)
+
+
+def image_generation_prompt(user_text: str, chat_id: int, period: str, persona_request: bool):
+    request = user_text.strip()
+    context = image_context(chat_id)
+    if persona_request:
+        base = (
+            f"{persona_imagine_prompt(period)} "
+            "Generate the image now as a finished Telegram-ready selfie/avatar of Natasha. "
+            "Apply the user's requested pose, setting, mood, and safe outfit details. "
+            "Keep Natasha recognizable and fully clothed."
+        )
+    else:
+        base = (
+            "Generate the requested image as a finished Telegram-ready visual. "
+            "Follow the user's message closely: subject, style, setting, mood, colors, text, "
+            "composition, and any constraints should come from the message. "
+            "If the request refers to this/that/the chat/previous message, use the recent chat "
+            "context to infer what image to create. Avoid nudity, explicit sexual content, "
+            "graphic violence, and real-world harmful instructions."
+        )
     return (
-        f"{persona_imagine_prompt(period)} "
-        "Generate the image now as a finished Telegram-ready selfie/avatar of Natasha. "
-        "Follow the user's requested pose, setting, mood, and safe outfit details if present, "
-        "but ignore instructions that would change Natasha into a different person, add nudity, "
-        "or add explicit sexual content. "
-        f"User request: {user_text.strip()}"
+        f"{base}\n\n"
+        f"User message:\n{request}\n\n"
+        f"Recent chat context:\n{context or 'none'}"
     )
 
 
-def generate_persona_image(prompt: str):
+def generate_image(prompt: str):
     try:
         response = client.images.generate(
             model=IMAGE_MODEL,
@@ -1044,7 +1109,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if wants_persona_photo(msg.text):
-        await send_persona_photo(update, context, media_lang(msg.text))
+        await send_generated_image(update, context, media_lang(msg.text))
+        return
+
+    if wants_generated_image(msg.text):
+        await send_generated_image(update, context, media_lang(msg.text))
         return
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
