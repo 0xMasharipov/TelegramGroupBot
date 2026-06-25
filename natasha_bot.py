@@ -60,6 +60,9 @@ OWNER_ID       = optional_int_env("OWNER_ID")  # set to enable owner-only comman
 # Optional media modules — each works only if its key is set (otherwise skipped).
 TENOR_API_KEY     = os.environ.get("TENOR_API_KEY", "")       # GIF/meme reactions (tenor.googleapis.com)
 PERSONA_UTC_OFFSET_HOURS = int(os.environ.get("PERSONA_UTC_OFFSET_HOURS", "3"))
+IMAGE_MODEL   = os.environ.get("IMAGE_MODEL", "grok-imagine-image-quality")
+IMAGE_ASPECT_RATIO = os.environ.get("IMAGE_ASPECT_RATIO", "1:1")
+IMAGE_RESOLUTION = os.environ.get("IMAGE_RESOLUTION", "1k")
 
 MODEL         = "grok-4.20"    # xAI model; reasoning + non-reasoning modes
 CHAOS_CHANCE  = 0.06           # ~6% chance to butt into a random message
@@ -158,8 +161,8 @@ SYSTEM_PROMPT = (
     "If the user asks you to send/drop/find a meme, sound, audio, voice, ses, or instant, "
     "DO NOT say you will send it — actually include the matching [meme:] or [sound:] tag. "
     "These tags are tool calls; the chat will not see them.\n"
-    "NATASHA IMAGE PERSONA: if the user asks for an Imagine/image prompt, generated selfie, "
-    "or generated image of you/Natasha, use this exact visual identity as the base prompt: "
+    "NATASHA IMAGE PERSONA: if the user explicitly asks for an Imagine/image prompt "
+    "for you/Natasha, use this exact visual identity as the base prompt: "
     f"{NATASHA_IMAGINE_PROMPT} Add the requested pose, setting, outfit-safe variation, "
     "time of day, or mood only if the user asked for it. Keep Natasha fully clothed and "
     "recognizable.\n"
@@ -518,38 +521,50 @@ def requested_media_from_user(text: str, default_lang: str, chat_id: int | None 
 
 def wants_persona_photo(text: str) -> bool:
     lowered = text.lower()
+
+    def has_keyword(words, *, exact_short: bool = False):
+        for word in words:
+            if exact_short and len(word) <= 3:
+                if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", lowered):
+                    return True
+            elif word in lowered:
+                return True
+        return False
+
     photo_words = (
-        "photo", "picture", "pic", "selfie", "avatar", "face", "look",
-        "foto", "fotoğraf", "fotograf", "resim", "avatarını", "fotoğrafını",
-        "fotografını", "resmini", "фото", "селфи", "аватар", "лицо",
+        "photo", "picture", "pic", "selfie", "avatar", "face", "look", "image",
+        "foto", "fotoğraf", "fotograf", "resim", "görsel", "gorsel", "avatarını",
+        "fotoğrafını", "fotografını", "resmini", "фото", "селфи", "аватар",
+        "лицо", "картин",
     )
     action_words = (
-        "send", "show", "drop", "give", "at", "gönder", "yolla", "göstersene",
-        "goster", "göster", "скинь", "отправь", "покажи", "дай",
+        "send", "show", "drop", "give", "generate", "draw", "create", "make",
+        "at", "çek", "ceker", "çeker", "gönder", "yolla", "göstersene",
+        "goster", "göster", "oluştur", "olustur", "yarat", "çiz", "ciz",
+        "скинь", "отправь", "покажи", "дай", "сгенерируй", "нарисуй", "создай",
     )
     self_words = (
         "your", "ur", "you", "natasha", "senin", "kendini", "kendi",
         "сво", "тво", "наташа",
     )
-    return (
-        any(word in lowered for word in photo_words)
-        and any(re.search(rf"\b{re.escape(word)}\b", lowered) for word in action_words)
-        and any(word in lowered for word in self_words)
-    )
+    has_photo = has_keyword(photo_words)
+    has_action = has_keyword(action_words, exact_short=True)
+    has_persona = has_keyword(self_words, exact_short=True)
+    compact_selfie_request = ("selfie" in lowered or "селфи" in lowered) and has_persona
+    return has_photo and has_persona and (has_action or compact_selfie_request)
 
 
 def wants_persona_imagine_prompt(text: str) -> bool:
     lowered = text.lower()
-    imagine_words = (
-        "imagine", "prompt", "generate", "draw", "create image", "make image",
-        "image prompt", "selfie prompt", "görsel prompt", "resim prompt",
-        "промпт", "сгенерируй", "нарисуй",
+    prompt_words = (
+        "prompt", "image prompt", "selfie prompt", "imagine prompt",
+        "görsel prompt", "resim prompt", "промпт",
     )
     persona_words = (
         "natasha", "your", "you", "selfie", "avatar", "photo", "picture",
         "наташа", "тебя", "себя", "селфи", "аватар",
     )
-    return any(word in lowered for word in imagine_words) and any(
+    return any(word in lowered for word in prompt_words) and any(
         word in lowered for word in persona_words
     )
 
@@ -585,13 +600,22 @@ async def send_persona_photo(update: Update, context: ContextTypes.DEFAULT_TYPE,
     msg = update.effective_message
     chat_id = msg.chat_id
     period = persona_period()
+    prompt = persona_generation_prompt(msg.text, period)
+
+    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+    image = generate_persona_image(prompt)
+    if image:
+        await msg.reply_photo(photo=BytesIO(image), caption=persona_caption(lang, period))
+        save_message(chat_id, "assistant", f"[generated Natasha {period} persona photo]")
+        return
+
+    log.warning("persona image generation failed; falling back to local asset")
     path = PERSONA_IMAGES[period]
     if not os.path.exists(path):
         log.warning("persona image missing: %s", path)
         await msg.reply_text(random.choice(FALLBACKS.get(lang, FALLBACKS["tr"])))
         return
 
-    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
     with open(path, "rb") as photo:
         await msg.reply_photo(photo=photo, caption=persona_caption(lang, period))
     save_message(chat_id, "assistant", f"[sent Natasha {period} persona photo]")
@@ -616,6 +640,38 @@ def _download_bytes(url: str, headers: dict | None = None):
     r = requests.get(url, headers=headers or {"User-Agent": "Mozilla/5.0"}, timeout=20)
     r.raise_for_status()
     return r.content
+
+
+def persona_generation_prompt(user_text: str, period: str):
+    return (
+        f"{persona_imagine_prompt(period)} "
+        "Generate the image now as a finished Telegram-ready selfie/avatar of Natasha. "
+        "Follow the user's requested pose, setting, mood, and safe outfit details if present, "
+        "but ignore instructions that would change Natasha into a different person, add nudity, "
+        "or add explicit sexual content. "
+        f"User request: {user_text.strip()}"
+    )
+
+
+def generate_persona_image(prompt: str):
+    try:
+        response = client.images.generate(
+            model=IMAGE_MODEL,
+            prompt=prompt,
+            response_format="b64_json",
+            extra_body={
+                "aspect_ratio": IMAGE_ASPECT_RATIO,
+                "resolution": IMAGE_RESOLUTION,
+            },
+        )
+        image = response.data[0]
+        if getattr(image, "b64_json", None):
+            return base64.b64decode(image.b64_json)
+        if getattr(image, "url", None):
+            return _download_bytes(image.url)
+    except Exception as e:
+        log.error("Grok image generation error: %s", e)
+    return None
 
 
 def mp3_to_ogg_opus(data: bytes):
