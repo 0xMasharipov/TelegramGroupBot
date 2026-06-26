@@ -1,4 +1,4 @@
-![Natasha — Grok-powered Telegram group bot](assets/natasha_readme_banner.png)
+![Natasha — Grok-powered Telegram group bot](/natasha_readme_banner.png)
 
 # Natasha Telegram Group Bot
 
