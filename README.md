@@ -1,10 +1,10 @@
-![Natasha — Grok-powered Telegram group bot](/natasha_readme_banner.png)
+![Natasha — Grok-powered Telegram group bot](assets/natasha_readme_banner.png)
 
 # Natasha Telegram Group Bot
 
 **Natasha** is a Grok-powered Telegram group bot for chaotic, multilingual group chats. She replies like a real chat member, remembers lightweight context, reacts to photos, and can drop GIFs, Imgflip meme templates, and MyInstants voice-note sounds without needing slash commands.
 
-![Natasha profile](/natasha_profile.png)
+![Natasha profile](assets/natasha_profile.png)
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=flat-square&logo=telegram&logoColor=white)
@@ -57,6 +57,7 @@ Natasha uses Telegram polling, so local development does not need a webhook or p
 | `IMAGE_MODEL` | No | `grok-imagine-image-quality` | xAI Imagine model for generated Natasha photos |
 | `IMAGE_ASPECT_RATIO` | No | `1:1` | Aspect ratio for generated Natasha photos |
 | `IMAGE_RESOLUTION` | No | `1k` | Image resolution, usually `1k` or `2k` |
+| `IMAGE_API_TIMEOUT_SECONDS` | No | `120` | Timeout for Grok Imagine generation/edit requests |
 
 Imgflip meme templates and MyInstants sounds use public pages and do not require API keys.
 
@@ -94,7 +95,11 @@ Rules:
 
 When a user asks Natasha to create, draw, generate, or send an image, she generates a new Grok Imagine image from the user's message and sends it directly to the Telegram chat. If the request refers to recent chat context, Natasha includes nearby messages in the image prompt so the generated image follows what the user meant.
 
-When the request is specifically for Natasha's photo, selfie, avatar, or picture, the prompt locks her face, body proportions, hair, makeup, black knit sweater, choker, cross earrings, nail polish, and fixed room components. A request may change only her pose, camera angle, or mood; it cannot change her identity, outfit, or the scheduled room setup.
+When the request is specifically for Natasha's photo, selfie, avatar, or picture, the prompt locks her face, body proportions, hair, black knit sweater, choker, cross earrings, nail polish, and fixed room components. It uses exactly one of two fixed appearance references: signature goth makeup or a completely natural bare face. A request may change only her pose, camera angle, or mood; it cannot change her identity, outfit, or the scheduled room setup. Stickers, emojis, decals, face paint, text, logos, and watermarks are prohibited.
+
+Natasha image requests use `assets/natasha_profile.png` (makeup) or `assets/natasha_profile_natural.png` (bare face) as a base64 reference image and send it with the prompt to Grok's image-edit endpoint. Grok returns the generated image, which the bot downloads and replies to the requesting Telegram message immediately. This keeps Natasha visually consistent rather than relying on a text-only image prompt.
+
+Common self-photo requests are matched directly in Turkish, Russian, and English. For ambiguous natural-language requests such as “kendini göster” or “can I see you?”, Natasha asks Grok to classify the intent before generating, so users do not need to use one exact command or the word “selfie.”
 
 Her self-portrait background follows this local-time schedule:
 

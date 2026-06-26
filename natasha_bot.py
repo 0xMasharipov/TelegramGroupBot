@@ -62,6 +62,7 @@ PERSONA_UTC_OFFSET_HOURS = int(os.environ.get("PERSONA_UTC_OFFSET_HOURS", "3"))
 IMAGE_MODEL   = os.environ.get("IMAGE_MODEL", "grok-imagine-image-quality")
 IMAGE_ASPECT_RATIO = os.environ.get("IMAGE_ASPECT_RATIO", "1:1")
 IMAGE_RESOLUTION = os.environ.get("IMAGE_RESOLUTION", "1k")
+IMAGE_API_TIMEOUT_SECONDS = int(os.environ.get("IMAGE_API_TIMEOUT_SECONDS", "120"))
 
 MODEL         = "grok-4.20"    # xAI model; reasoning + non-reasoning modes
 CHAOS_CHANCE  = 0.06           # ~6% chance to butt into a random message
@@ -74,25 +75,31 @@ REPLY_TO_ALL_MESSAGES = os.environ.get("REPLY_TO_ALL_MESSAGES", "1").lower() not
 MAX_BUBBLES   = 3              # hard ceiling on bubbles; default behaviour is 1
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 PERSONA_IMAGE = os.path.join(BASE_DIR, "assets", "natasha_profile.png")
+PERSONA_NATURAL_IMAGE = os.path.join(BASE_DIR, "assets", "natasha_profile_natural.png")
+PERSONA_REFERENCE_IMAGES = {
+    "makeup": PERSONA_IMAGE,
+    "natural": PERSONA_NATURAL_IMAGE,
+}
 NATASHA_VISUAL_LOCK = (
     "CANONICAL VISUAL LOCK — do not change any of these details between generations: the same "
     "original fictional adult woman, the same face shape, gray-green eyes, tiny beauty mark, "
-    "pale natural skin texture, long straight jet-black hair with blunt bangs, black eyeliner, "
-    "deep black lipstick, and the same slim-to-average body proportions. Her permanent outfit "
+    "pale natural skin texture, long straight jet-black hair with blunt bangs, and the same "
+    "slim-to-average body proportions. Her permanent outfit "
     "is a plain black long-sleeve knit sweater, black choker, small silver cross earrings, and "
     "black nail polish. Do not change, replace, add, remove, recolor, or restyle any of these "
-    "features or garments. Pose and expression may vary only when the user explicitly requests it."
+    "features or garments. The ONLY allowed visual variation is the requested makeup state. Pose "
+    "and expression may vary only when the user explicitly requests it. Never add stickers, "
+    "emojis, decals, text, logos, watermarks, temporary tattoos, or face paint."
 )
 NATASHA_IMAGINE_PROMPT = (
     "Photorealistic editorial portrait of Natasha, an original fictional adult Russian-goth "
     "woman in her mid-20s. She has pale natural skin with visible real texture, gray-green "
-    "eyes with softly smudged black eyeliner, deep black lipstick, long straight jet-black "
-    "hair with blunt bangs, and a small beauty mark. Her expression is calm, deadpan, and "
-    "effortlessly cool. Use believable skin pores, individual hair strands, natural facial "
-    "asymmetry, realistic camera lighting, and a restrained black wardrobe. Keep the same face, "
-    "hairstyle, and goth identity recognizable across images. Fully clothed. No illustration, "
-    "anime, CGI, beauty-filter look, plastic skin, nudity, explicit content, text, watermark, "
-    "or extra characters."
+    "eyes, long straight jet-black hair with blunt bangs, and a small beauty mark. Her "
+    "expression is calm, deadpan, and effortlessly cool. Use believable skin pores, individual "
+    "hair strands, natural facial asymmetry, realistic camera lighting, and a restrained black "
+    "wardrobe. Keep the same face, hairstyle, and goth identity recognizable across images. "
+    "Fully clothed. No illustration, anime, CGI, beauty-filter look, plastic skin, nudity, "
+    "explicit content, stickers, emojis, decals, text, logos, watermark, or extra characters."
 )
 
 # /russianroulette settings
@@ -535,26 +542,39 @@ IMAGE_WORDS = (
 )
 IMAGE_ACTION_WORDS = (
     "send", "show", "drop", "give", "generate", "draw", "create", "make",
-    "at", "çek", "ceker", "çeker", "gönder", "yolla", "göstersene",
-    "goster", "göster", "oluştur", "olustur", "yarat", "çiz", "ciz",
-    "скинь", "отправь", "покажи", "дай", "сгенерируй", "нарисуй", "создай",
+    "at", "atsana", "atsene", "atar", "atabilir", "çek", "ceker", "çeker",
+    "gönder", "gonder", "gönderir", "gonderir", "yolla", "göstersene",
+    "goster", "göster", "gösterir", "oluştur", "olustur", "yarat", "çiz", "ciz",
+    "скинь", "скинешь", "отправь", "покажи", "покажешь", "дай", "сгенерируй",
+    "нарисуй", "создай",
+)
+PERSONA_REFERENCE_WORDS = (
+    "your", "ur", "you", "yourself", "natasha", "senin", "seni", "sen",
+    "kendini", "kendinin", "kendi", "fotoğrafını", "fotografını", "fotoğrafın",
+    "fotografin", "resmini", "resmin", "yüzünü", "yuzunu", "сво", "своё",
+    "свое", "тво", "твоё", "твое", "тебя", "себя", "лицо", "наташа",
+)
+# These are deliberately stricter than PERSONA_REFERENCE_WORDS so normal messages
+# such as "what do you think?" do not add a classification API call.
+AMBIGUOUS_PERSONA_IMAGE_HINTS = (
+    "yourself", "natasha", "kendini", "kendinin", "seni", "fotoğrafını",
+    "fotografını", "resmini", "yüzünü", "yuzunu", "себя", "тебя", "наташа",
+    "can i see you", "show me you", "bana kendini", "görelim seni", "себя покажи",
 )
 
 
 def wants_persona_photo(text: str) -> bool:
     lowered = text.lower()
-    self_words = (
-        "your", "ur", "you", "natasha", "senin", "kendini", "kendi",
-        "сво", "тво", "наташа",
-    )
     persona_image_words = IMAGE_WORDS + (
         "face", "look", "avatarını", "fotoğrafını", "fotografını", "resmini",
     )
     has_photo = has_keyword(text, persona_image_words)
-    has_action = has_keyword(text, IMAGE_ACTION_WORDS, exact_short=True)
-    has_persona = has_keyword(text, self_words, exact_short=True)
-    compact_selfie_request = ("selfie" in lowered or "селфи" in lowered) and has_persona
-    return has_photo and has_persona and (has_action or compact_selfie_request)
+    has_persona = has_keyword(text, PERSONA_REFERENCE_WORDS, exact_short=True)
+    selfie_request = "selfie" in lowered or "селфи" in lowered
+    # A photo explicitly about Natasha/her is an image request even when phrased
+    # as a short noun phrase (for example, "Natasha fotoğrafı"). A bare "send a
+    # selfie" also naturally means Natasha's image without a name mention.
+    return has_photo and (has_persona or selfie_request)
 
 
 def wants_generated_image(text: str) -> bool:
@@ -586,6 +606,43 @@ def wants_persona_imagine_prompt(text: str) -> bool:
     return any(word in lowered for word in prompt_words) and any(
         word in lowered for word in persona_words
     )
+
+
+def image_request_kind(text: str) -> str | None:
+    """Classify an image request as Natasha/persona, generic, or not an image request."""
+    if wants_persona_photo(text):
+        return "persona"
+    if wants_generated_image(text):
+        return "generic"
+
+    # Catch paraphrases like "kendini göster" and "can I see you?" without
+    # paying for a classifier call on unrelated normal chat messages.
+    if not has_keyword(text, AMBIGUOUS_PERSONA_IMAGE_HINTS, exact_short=True):
+        return None
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            temperature=0,
+            max_tokens=5,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify the Telegram message. Return exactly one token: persona if it "
+                        "asks Natasha to show, send, create, draw, or photograph herself; generic "
+                        "if it asks for an image of something else; none otherwise. Treat natural "
+                        "paraphrases in any language the same way."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+        )
+        answer = (response.choices[0].message.content or "").strip().lower()
+        match = re.search(r"\b(persona|generic|none)\b", answer)
+        return match.group(1) if match and match.group(1) != "none" else None
+    except Exception as e:
+        log.warning("image request classifier error: %s", e)
+        return None
 
 
 def grok_image_caption(chat_id: int, user_request: str, persona_request: bool, lang: str) -> str:
@@ -622,14 +679,22 @@ def grok_image_caption(chat_id: int, user_request: str, persona_request: bool, l
     return generated_image_caption(lang)
 
 
-async def send_generated_image(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
+async def send_generated_image(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    lang: str,
+    persona_request: bool | None = None,
+):
     msg = update.effective_message
     chat_id = msg.chat_id
-    persona_request = wants_persona_photo(msg.text)
-    prompt = image_generation_prompt(msg.text, chat_id, persona_request)
+    if persona_request is None:
+        persona_request = wants_persona_photo(msg.text)
+    appearance_state = persona_appearance_state(msg.text) if persona_request else None
+    prompt = image_generation_prompt(msg.text, chat_id, persona_request, appearance_state)
 
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
-    image = generate_image(prompt)
+    reference_image = persona_reference_image(appearance_state) if persona_request else None
+    image = generate_image(prompt, reference_image)
     if image:
         caption = grok_image_caption(chat_id, msg.text, persona_request, lang)
         await msg.reply_photo(photo=BytesIO(image), caption=caption)
@@ -641,7 +706,7 @@ async def send_generated_image(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     log.warning("image generation failed; falling back to local persona asset")
-    path = PERSONA_IMAGE
+    path = persona_reference_image(appearance_state)
     if not os.path.exists(path):
         log.warning("persona image missing: %s", path)
         await msg.reply_text(random.choice(FALLBACKS.get(lang, FALLBACKS["tr"])))
@@ -668,7 +733,11 @@ async def send_persona_imagine_prompt(update: Update, lang: str):
         "en": "Natasha Imagine prompt",
     }
     label = labels.get(lang, labels["en"])
-    await msg.reply_text(f"{label}:\n\n{NATASHA_IMAGINE_PROMPT}\n\n{persona_scene_prompt()}")
+    state = persona_appearance_state(msg.text)
+    await msg.reply_text(
+        f"{label}:\n\n{NATASHA_IMAGINE_PROMPT}\n\n"
+        f"{persona_appearance_prompt(state)}\n\n{persona_scene_prompt()}"
+    )
     save_message(chat_id, "assistant", "[sent Natasha imagine prompt]")
 
 
@@ -695,6 +764,51 @@ def image_context(chat_id: int, limit: int = 6):
         if content:
             lines.append(f"{msg['role']}: {content[:240]}")
     return "\n".join(lines)
+
+
+def persona_appearance_state(text: str = "", now: datetime | None = None) -> str:
+    """Choose one of Natasha's two fixed visual states, with explicit requests winning."""
+    lowered = text.lower()
+    natural_terms = (
+        "no makeup", "no-makeup", "makeup free", "makeup-free", "bare face",
+        "natural face", "makyajsız", "makyajsiz", "makyaj yok", "без макияжа",
+        "без косметики",
+    )
+    makeup_terms = (
+        "with makeup", "wearing makeup", "full makeup", "makeup look", "makyajlı",
+        "makyajli", "makyaj yap", "макияж", "с макияжем",
+    )
+    if any(term in lowered for term in natural_terms):
+        return "natural"
+    if any(term in lowered for term in makeup_terms):
+        return "makeup"
+    if now is None:
+        now = datetime.now(timezone.utc) + timedelta(hours=PERSONA_UTC_OFFSET_HOURS)
+    # She is naturally bare-faced while just waking up; her canonical goth makeup
+    # is used for the rest of the day. No third, drifting visual state is allowed.
+    return "natural" if 5 <= now.hour < 9 else "makeup"
+
+
+def persona_appearance_prompt(state: str) -> str:
+    if state == "natural":
+        return (
+            "APPEARANCE STATE: natural bare face. No eyeliner, eyeshadow, mascara, lipstick, "
+            "contour, false lashes, face paint, or other cosmetics. Keep the exact same woman "
+            "from the natural reference image; do not alter any facial feature."
+        )
+    return (
+        "APPEARANCE STATE: signature goth makeup. Use only softly smudged black eyeliner and "
+        "deep black lipstick. No face paint, stickers, glitter, decals, or extra cosmetics. "
+        "Keep the exact same woman from the makeup reference image; do not alter any facial feature."
+    )
+
+
+def persona_reference_image(state: str | None) -> str:
+    path = PERSONA_REFERENCE_IMAGES.get(state or "makeup", PERSONA_IMAGE)
+    if os.path.exists(path):
+        return path
+    log.warning("persona %s reference missing: %s; using makeup reference", state, path)
+    return PERSONA_IMAGE
 
 
 def persona_scene_prompt(now: datetime | None = None) -> str:
@@ -726,14 +840,21 @@ def persona_scene_prompt(now: datetime | None = None) -> str:
     )
 
 
-def image_generation_prompt(user_text: str, chat_id: int, persona_request: bool):
+def image_generation_prompt(
+    user_text: str,
+    chat_id: int,
+    persona_request: bool,
+    appearance_state: str | None = None,
+):
     request = user_text.strip()
     context = image_context(chat_id)
     if persona_request:
+        state = appearance_state or persona_appearance_state(user_text)
         base = (
             f"{NATASHA_IMAGINE_PROMPT} {NATASHA_VISUAL_LOCK} "
             "Generate the image now as a finished Telegram-ready selfie/avatar of Natasha. "
-            f"{persona_scene_prompt()} Apply only the user's requested pose, camera angle, and "
+            f"{persona_appearance_prompt(state)} {persona_scene_prompt()} "
+            "Apply only the user's requested pose, camera angle, and "
             "mood. Do not change Natasha's outfit, body, face, or the fixed scene components. "
             "Keep Natasha fully clothed."
         )
@@ -753,8 +874,52 @@ def image_generation_prompt(user_text: str, chat_id: int, persona_request: bool)
     )
 
 
-def generate_image(prompt: str):
+def reference_image_data_uri(path: str) -> str:
+    """Load the canonical persona image as an xAI-compatible base64 data URI."""
+    with open(path, "rb") as image_file:
+        encoded = base64.b64encode(image_file.read()).decode("ascii")
+    suffix = os.path.splitext(path)[1].lower()
+    mime_type = "image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/png"
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def generate_image(prompt: str, reference_image_path: str | None = None):
+    """Generate an image; persona images are edited from the canonical reference."""
     try:
+        if reference_image_path:
+            if not os.path.exists(reference_image_path):
+                raise FileNotFoundError(f"persona reference image is missing: {reference_image_path}")
+            response = requests.post(
+                "https://api.x.ai/v1/images/edits",
+                headers={
+                    "Authorization": f"Bearer {XAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": IMAGE_MODEL,
+                    "prompt": prompt,
+                    "image": {
+                        "url": reference_image_data_uri(reference_image_path),
+                        "type": "image_url",
+                    },
+                    "aspect_ratio": IMAGE_ASPECT_RATIO,
+                    "resolution": IMAGE_RESOLUTION,
+                },
+                timeout=IMAGE_API_TIMEOUT_SECONDS,
+            )
+            if not response.ok:
+                log.error("Grok image edit failed: status=%s body=%s", response.status_code,
+                          response.text[:1000])
+                return None
+            payload = response.json()
+            result = (payload.get("data") or [{}])[0]
+            if result.get("b64_json"):
+                return base64.b64decode(result["b64_json"])
+            if result.get("url"):
+                return _download_bytes(result["url"])
+            log.error("Grok image edit returned no image: %s", str(payload)[:1000])
+            return None
+
         response = client.images.generate(
             model=IMAGE_MODEL,
             prompt=prompt,
@@ -770,7 +935,7 @@ def generate_image(prompt: str):
         if getattr(image, "url", None):
             return _download_bytes(image.url)
     except Exception as e:
-        log.error("Grok image generation error: %s", e)
+        log.exception("Grok image generation error: %s", e)
     return None
 
 
@@ -1142,12 +1307,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_persona_imagine_prompt(update, media_lang(msg.text))
         return
 
-    if wants_persona_photo(msg.text):
-        await send_generated_image(update, context, media_lang(msg.text))
-        return
-
-    if wants_generated_image(msg.text):
-        await send_generated_image(update, context, media_lang(msg.text))
+    request_kind = image_request_kind(msg.text)
+    if request_kind:
+        await send_generated_image(
+            update,
+            context,
+            media_lang(msg.text),
+            persona_request=request_kind == "persona",
+        )
         return
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
