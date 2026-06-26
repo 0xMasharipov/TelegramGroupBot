@@ -21,6 +21,7 @@ import random
 import asyncio
 import sqlite3
 import logging
+import time
 import shutil
 import subprocess
 import tempfile
@@ -63,6 +64,8 @@ IMAGE_MODEL   = os.environ.get("IMAGE_MODEL", "grok-imagine-image-quality")
 IMAGE_ASPECT_RATIO = os.environ.get("IMAGE_ASPECT_RATIO", "1:1")
 IMAGE_RESOLUTION = os.environ.get("IMAGE_RESOLUTION", "1k")
 IMAGE_API_TIMEOUT_SECONDS = int(os.environ.get("IMAGE_API_TIMEOUT_SECONDS", "120"))
+MAX_CONCURRENT_GROK_REQUESTS = max(1, int(os.environ.get("MAX_CONCURRENT_GROK_REQUESTS", "4")))
+MAX_CONCURRENT_IMAGE_JOBS = max(1, int(os.environ.get("MAX_CONCURRENT_IMAGE_JOBS", "2")))
 
 MODEL         = "grok-4.20"    # xAI model; reasoning + non-reasoning modes
 CHAOS_CHANCE  = 0.06           # ~6% chance to butt into a random message
@@ -101,6 +104,34 @@ NATASHA_IMAGINE_PROMPT = (
     "Fully clothed. No illustration, anime, CGI, beauty-filter look, plastic skin, nudity, "
     "explicit content, stickers, emojis, decals, text, logos, watermark, or extra characters."
 )
+
+# External APIs are the slow part of this bot. Keep them off Telegram's event
+# loop and bound concurrency so one busy group cannot exhaust API connections.
+grok_request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GROK_REQUESTS)
+image_generation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_IMAGE_JOBS)
+image_chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+async def run_blocking(label: str, func, *args):
+    """Run a synchronous SDK/HTTP call without blocking Telegram updates."""
+    started = time.perf_counter()
+    try:
+        return await asyncio.to_thread(func, *args)
+    finally:
+        log.info("%s completed in %.2fs", label, time.perf_counter() - started)
+
+
+async def run_grok_request(label: str, func, *args):
+    async with grok_request_semaphore:
+        return await run_blocking(label, func, *args)
+
+
+async def run_image_generation(chat_id: int, prompt: str, reference_image_path: str | None):
+    # Preserve ordering for competing image requests in one chat, while allowing
+    # other chats to keep responding up to the global image-job limit.
+    async with image_chat_locks[chat_id]:
+        async with image_generation_semaphore:
+            return await run_blocking("Grok image generation", generate_image, prompt, reference_image_path)
 
 # /russianroulette settings
 MUTE_ON_DEATH = True           # mute the loser (needs the bot to be admin)
@@ -609,7 +640,7 @@ def wants_persona_imagine_prompt(text: str) -> bool:
 
 
 def image_request_kind(text: str) -> str | None:
-    """Classify an image request as Natasha/persona, generic, or not an image request."""
+    """Return the direct match, or 'ambiguous' when Grok should disambiguate it."""
     if wants_persona_photo(text):
         return "persona"
     if wants_generated_image(text):
@@ -619,6 +650,11 @@ def image_request_kind(text: str) -> str | None:
     # paying for a classifier call on unrelated normal chat messages.
     if not has_keyword(text, AMBIGUOUS_PERSONA_IMAGE_HINTS, exact_short=True):
         return None
+    return "ambiguous"
+
+
+def grok_image_request_kind(text: str) -> str | None:
+    """Use Grok only for an already-filtered, ambiguous image request."""
     try:
         response = client.chat.completions.create(
             model=MODEL,
@@ -694,14 +730,28 @@ async def send_generated_image(
 
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
     reference_image = persona_reference_image(appearance_state) if persona_request else None
-    image = generate_image(prompt, reference_image)
+    # Caption and image generation do not depend on one another, so overlap the
+    # two Grok requests instead of making the user wait for both serially.
+    caption_task = asyncio.create_task(
+        run_grok_request(
+            "Grok image caption",
+            grok_image_caption,
+            chat_id,
+            msg.text,
+            persona_request,
+            lang,
+        )
+    )
+    image = await run_image_generation(chat_id, prompt, reference_image)
     if image:
-        caption = grok_image_caption(chat_id, msg.text, persona_request, lang)
+        caption = await caption_task
         await msg.reply_photo(photo=BytesIO(image), caption=caption)
         save_message(chat_id, "assistant", "[generated image from user request]")
         return
 
     if not persona_request:
+        caption_task.cancel()
+        await asyncio.gather(caption_task, return_exceptions=True)
         await msg.reply_text(random.choice(FALLBACKS.get(lang, FALLBACKS["tr"])))
         return
 
@@ -715,7 +765,7 @@ async def send_generated_image(
     with open(path, "rb") as photo:
         await msg.reply_photo(
             photo=photo,
-            caption=grok_image_caption(chat_id, msg.text, True, lang),
+            caption=await caption_task,
         )
     save_message(chat_id, "assistant", "[sent Natasha fallback persona photo]")
 
@@ -1308,6 +1358,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     request_kind = image_request_kind(msg.text)
+    if request_kind == "ambiguous":
+        request_kind = await run_grok_request(
+            "Grok image request classification",
+            grok_image_request_kind,
+            msg.text,
+        )
     if request_kind:
         await send_generated_image(
             update,
@@ -1318,7 +1374,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    reply = grok_reply(chat_id)
+    reply = await run_grok_request("Grok chat reply", grok_reply, chat_id)
     save_message(chat_id, "assistant", reply)
 
     text, gif_q, meme_q, snd_q = extract_media(reply)
@@ -1372,7 +1428,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     b64 = base64.b64encode(bytes(raw)).decode()
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    reply = grok_vision_reply(chat_id, b64, name, caption)
+    reply = await run_grok_request("Grok vision reply", grok_vision_reply, chat_id, b64, name, caption)
     save_message(chat_id, "assistant", reply)
 
     text, gif_q, meme_q, snd_q = extract_media(reply)
