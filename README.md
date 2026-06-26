@@ -4,7 +4,7 @@
 
 **Natasha** is a Grok-powered Telegram group bot for chaotic, multilingual group chats. She replies like a real chat member, remembers lightweight context, reacts to photos, and can drop GIFs, Imgflip meme templates, and MyInstants voice-note sounds without needing slash commands.
 
-![Natasha profile](assets/natasha_profile.png)
+![Natasha profile](/natasha_profile.png)
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=flat-square&logo=telegram&logoColor=white)
