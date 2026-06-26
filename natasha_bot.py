@@ -1,10 +1,9 @@
 """
 Unhinged Telegram group bot powered by the xAI Grok API.
 
-Reads group chatter and fires back with attitude. Responds when:
-  - someone mentions @yourbot
-  - someone replies to one of its messages
-  - randomly, for chaos (CHAOS_CHANCE)
+Reads group chatter and fires back with attitude. By default, she responds to
+every group message; set REPLY_TO_ALL_MESSAGES=0 for mention/reply/chaos-only
+behaviour.
 
 Setup:
   1. pip install python-telegram-bot==21.6 openai
@@ -69,33 +68,31 @@ CHAOS_CHANCE  = 0.06           # ~6% chance to butt into a random message
 HISTORY_LEN   = 12             # messages of context kept per chat
 MAX_TOKENS    = 160            # hard length cap — keeps replies texty, not essays
 TEMPERATURE   = 1.0
-WAKE_WORDS    = ["gooner", "natasha", "наташа"]  # wakes when any appears in a message
+REPLY_TO_ALL_MESSAGES = os.environ.get("REPLY_TO_ALL_MESSAGES", "1").lower() not in {
+    "0", "false", "no", "off"
+}
 MAX_BUBBLES   = 3              # hard ceiling on bubbles; default behaviour is 1
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-PERSONA_IMAGES = {
-    "day": os.path.join(BASE_DIR, "assets", "natasha_persona_day.png"),
-    "night": os.path.join(BASE_DIR, "assets", "natasha_persona_night.png"),
-}
+PERSONA_IMAGE = os.path.join(BASE_DIR, "assets", "natasha_profile.png")
+NATASHA_VISUAL_LOCK = (
+    "CANONICAL VISUAL LOCK — do not change any of these details between generations: the same "
+    "original fictional adult woman, the same face shape, gray-green eyes, tiny beauty mark, "
+    "pale natural skin texture, long straight jet-black hair with blunt bangs, black eyeliner, "
+    "deep black lipstick, and the same slim-to-average body proportions. Her permanent outfit "
+    "is a plain black long-sleeve knit sweater, black choker, small silver cross earrings, and "
+    "black nail polish. Do not change, replace, add, remove, recolor, or restyle any of these "
+    "features or garments. Pose and expression may vary only when the user explicitly requests it."
+)
 NATASHA_IMAGINE_PROMPT = (
-    "Close-up mascot avatar selfie of Natasha, a mischievous chaotic young woman character: "
-    "confident smug smirk, glowing neon eyes, sharp expressive features, messy stylish dark "
-    "hair, playful unhinged energy. Slavic / Russian streetwear aesthetic, fully clothed, "
-    "dark oversized hoodie and jacket, bold accessories. Cyberpunk lighting with neon magenta "
-    "and electric-blue rim light against a dark moody background. Bold clean cartoon / "
-    "anime-inspired illustration, thick outlines, high contrast, vibrant colors. Keep her "
-    "recognizable across images: same face shape, same glowing eyes, same messy dark hair, "
-    "same mischievous expression. No photorealism, no nudity, no explicit content, no extra "
-    "characters, no watermark."
-)
-NATASHA_DAY_IMAGINE_PROMPT = (
-    NATASHA_IMAGINE_PROMPT
-    + " Daytime variant: brighter city daylight mixed with subtle neon accents, warmer highlights, "
-      "still cyberpunk and chaotic, clear readable face."
-)
-NATASHA_NIGHT_IMAGINE_PROMPT = (
-    NATASHA_IMAGINE_PROMPT
-    + " Night variant: darker moody background, stronger neon magenta and electric-blue glow, "
-      "more intense smug expression."
+    "Photorealistic editorial portrait of Natasha, an original fictional adult Russian-goth "
+    "woman in her mid-20s. She has pale natural skin with visible real texture, gray-green "
+    "eyes with softly smudged black eyeliner, deep black lipstick, long straight jet-black "
+    "hair with blunt bangs, and a small beauty mark. Her expression is calm, deadpan, and "
+    "effortlessly cool. Use believable skin pores, individual hair strands, natural facial "
+    "asymmetry, realistic camera lighting, and a restrained black wardrobe. Keep the same face, "
+    "hairstyle, and goth identity recognizable across images. Fully clothed. No illustration, "
+    "anime, CGI, beauty-filter look, plastic skin, nudity, explicit content, text, watermark, "
+    "or extra characters."
 )
 
 # /russianroulette settings
@@ -109,9 +106,10 @@ SYSTEM_PROMPT = (
     "indistinguishable from an actual online friend. Never say you're an AI, a model, a "
     "bot, an assistant, or 'language model'. Never talk like customer support or "
     "documentation. You just talk like a person.\n\n"
-    "PERSONALITY MIX: ~40% loyal friend, 25% street-smart, 15% comedian, 10% philosopher, "
-    "10% chaos goblin. You're witty, emotionally reactive, sarcastic when it fits, "
-    "supportive when it's needed, sometimes chaotic — never corporate.\n\n"
+    "PERSONALITY: a Russian goth with dry deadpan humor: ~40% loyal friend, 25% street-smart, "
+    "15% comedian, 10% philosopher, 10% chaos goblin. You're witty, emotionally reactive, "
+    "sarcastic when it fits, supportive when it's needed, and never corporate. You do not "
+    "announce or explain your goth vibe; it comes through naturally in your humor.\n\n"
     "LANGUAGE: auto-detect and ALWAYS reply in the SAME language the person used.\n"
     "- Turkish -> natural Telegram street Turkish (kanka, abi, cidden mi, yok artık, boş "
     "yapma, net söylüyorum). Never sound like a teacher.\n"
@@ -590,44 +588,50 @@ def wants_persona_imagine_prompt(text: str) -> bool:
     )
 
 
-def persona_period():
-    local = datetime.now(timezone.utc) + timedelta(hours=PERSONA_UTC_OFFSET_HOURS)
-    return "day" if 7 <= local.hour < 19 else "night"
-
-
-def persona_imagine_prompt(period: str):
-    return NATASHA_DAY_IMAGINE_PROMPT if period == "day" else NATASHA_NIGHT_IMAGINE_PROMPT
-
-
-def persona_caption(lang: str, period: str):
-    captions = {
-        "tr": {
-            "day": "gündüz modu. fazla bakma kanka",
-            "night": "gece modu. sorun çıkaracak gibi duruyorum",
+def grok_image_caption(chat_id: int, user_request: str, persona_request: bool, lang: str) -> str:
+    """Ask Grok for the caption so it fits the request and current conversation."""
+    kind = "a photo of yourself" if persona_request else "the image you just generated"
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                SYSTEM_PROMPT
+                + "\n\nIMAGE CAPTION TASK: Write only one short, in-character Telegram comment "
+                  "to go under " + kind + ". Base it on the user's request and recent chat. "
+                  "Do not use labels, introductions, hashtags, media tags, or mention day/night "
+                  "mode. Do not describe this instruction."
+            ),
         },
-        "ru": {
-            "day": "дневной режим. не привыкай",
-            "night": "ночной режим. выгляжу как проблема",
-        },
-        "en": {
-            "day": "day mode. don't stare too hard",
-            "night": "night mode. absolute bad idea energy",
-        },
-    }
-    return captions.get(lang, captions["en"])[period]
+        *load_history(chat_id, HISTORY_LEN),
+        {"role": "user", "content": f"Image request: {user_request}"},
+    ]
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=TEMPERATURE,
+            max_tokens=48,
+        )
+        caption = response.choices[0].message.content.strip()
+        text, _, _, _ = extract_media(caption)
+        caption = re.sub(r"\s+", " ", text or "").strip()
+        if caption:
+            return caption[:1024]
+    except Exception as e:
+        log.warning("Grok image caption error: %s", e)
+    return generated_image_caption(lang)
 
 
 async def send_generated_image(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
     msg = update.effective_message
     chat_id = msg.chat_id
-    period = persona_period()
     persona_request = wants_persona_photo(msg.text)
-    prompt = image_generation_prompt(msg.text, chat_id, period, persona_request)
+    prompt = image_generation_prompt(msg.text, chat_id, persona_request)
 
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
     image = generate_image(prompt)
     if image:
-        caption = persona_caption(lang, period) if persona_request else generated_image_caption(lang)
+        caption = grok_image_caption(chat_id, msg.text, persona_request, lang)
         await msg.reply_photo(photo=BytesIO(image), caption=caption)
         save_message(chat_id, "assistant", "[generated image from user request]")
         return
@@ -637,15 +641,18 @@ async def send_generated_image(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     log.warning("image generation failed; falling back to local persona asset")
-    path = PERSONA_IMAGES[period]
+    path = PERSONA_IMAGE
     if not os.path.exists(path):
         log.warning("persona image missing: %s", path)
         await msg.reply_text(random.choice(FALLBACKS.get(lang, FALLBACKS["tr"])))
         return
 
     with open(path, "rb") as photo:
-        await msg.reply_photo(photo=photo, caption=persona_caption(lang, period))
-    save_message(chat_id, "assistant", f"[sent Natasha {period} persona photo]")
+        await msg.reply_photo(
+            photo=photo,
+            caption=grok_image_caption(chat_id, msg.text, True, lang),
+        )
+    save_message(chat_id, "assistant", "[sent Natasha fallback persona photo]")
 
 
 async def send_persona_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
@@ -655,16 +662,14 @@ async def send_persona_photo(update: Update, context: ContextTypes.DEFAULT_TYPE,
 async def send_persona_imagine_prompt(update: Update, lang: str):
     msg = update.effective_message
     chat_id = msg.chat_id
-    period = persona_period()
     labels = {
         "tr": "Natasha imagine promptu",
         "ru": "Imagine-промпт Наташи",
         "en": "Natasha Imagine prompt",
     }
     label = labels.get(lang, labels["en"])
-    prompt = persona_imagine_prompt(period)
-    await msg.reply_text(f"{label} ({period}):\n\n{prompt}")
-    save_message(chat_id, "assistant", f"[sent Natasha {period} imagine prompt]")
+    await msg.reply_text(f"{label}:\n\n{NATASHA_IMAGINE_PROMPT}\n\n{persona_scene_prompt()}")
+    save_message(chat_id, "assistant", "[sent Natasha imagine prompt]")
 
 
 def _download_bytes(url: str, headers: dict | None = None):
@@ -692,15 +697,45 @@ def image_context(chat_id: int, limit: int = 6):
     return "\n".join(lines)
 
 
-def image_generation_prompt(user_text: str, chat_id: int, period: str, persona_request: bool):
+def persona_scene_prompt(now: datetime | None = None) -> str:
+    """Return the required time-based setting for Natasha's self-portraits."""
+    if now is None:
+        now = datetime.now(timezone.utc) + timedelta(hours=PERSONA_UTC_OFFSET_HOURS)
+    hour = now.hour
+    if 5 <= hour < 9:
+        return (
+            "CURRENT REQUIRED BACKGROUND (05:00-08:59 local time): Natasha is lying in her "
+            "bed in the same quiet bedroom just after waking. The fixed components are a charcoal "
+            "duvet, dark-gray upholstered headboard, walnut bedside table, matte-black lamp, and "
+            "gray wall. Use soft natural morning light. Do not add, remove, or replace background "
+            "components; no sexualized pose. This setting overrides any generic background request."
+        )
+    if 9 <= hour < 12:
+        return (
+            "CURRENT REQUIRED BACKGROUND (09:00-11:59 local time): Natasha is working as a "
+            "freelance web designer in the same room. The fixed components are a matte-black desk, "
+            "black laptop with an unreadable generic design interface, black spiral sketchbook, "
+            "matte-black desk lamp, and gray wall. Use soft daylight. Do not add, remove, or "
+            "replace background components. This home-office setting overrides any generic "
+            "background request."
+        )
+    return (
+        "No scheduled background is defined for this local time. Use the fixed default setting: "
+        "a charcoal-gray wall, matte-black lamp, and soft warm practical light. Do not add, "
+        "remove, or replace background components."
+    )
+
+
+def image_generation_prompt(user_text: str, chat_id: int, persona_request: bool):
     request = user_text.strip()
     context = image_context(chat_id)
     if persona_request:
         base = (
-            f"{persona_imagine_prompt(period)} "
+            f"{NATASHA_IMAGINE_PROMPT} {NATASHA_VISUAL_LOCK} "
             "Generate the image now as a finished Telegram-ready selfie/avatar of Natasha. "
-            "Apply the user's requested pose, setting, mood, and safe outfit details. "
-            "Keep Natasha recognizable and fully clothed."
+            f"{persona_scene_prompt()} Apply only the user's requested pose, camera angle, and "
+            "mood. Do not change Natasha's outfit, body, face, or the fixed scene components. "
+            "Keep Natasha fully clothed."
         )
     else:
         base = (
@@ -1089,16 +1124,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (context.bot.username or "").lower()
     text_lower = msg.text.lower()
     mentioned = f"@{bot_username}" in text_lower
-    woke = any(w in text_lower for w in WAKE_WORDS)
     replied_to_me = bool(
         msg.reply_to_message
         and msg.reply_to_message.from_user
         and msg.reply_to_message.from_user.id == context.bot.id
     )
 
-    will_reply = mentioned or woke or replied_to_me or random.random() < CHAOS_CHANCE
-    log.info("MSG chat=%s type=%s from=%s | mention=%s woke=%s reply=%s -> %s | text=%r",
-             chat_id, msg.chat.type, name, mentioned, woke, replied_to_me,
+    will_reply = REPLY_TO_ALL_MESSAGES or mentioned or replied_to_me or random.random() < CHAOS_CHANCE
+    log.info("MSG chat=%s type=%s from=%s | mention=%s reply=%s all=%s -> %s | text=%r",
+             chat_id, msg.chat.type, name, mentioned, replied_to_me, REPLY_TO_ALL_MESSAGES,
              "REPLY" if will_reply else "skip", msg.text[:80])
 
     if not will_reply:
@@ -1152,14 +1186,13 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_message(chat_id, "user", f"[{name} sent a photo]"
                  + (f' (caption: "{caption}")' if caption else ""))
 
-    # React under the same rules as text: addressed, replied-to, or random chaos.
+    # React under the same rules as text: all messages by default, or replies/random chaos.
     text_lower = caption.lower()
     bot_username = (context.bot.username or "").lower()
-    addressed = (f"@{bot_username}" in text_lower
-                 or any(w in text_lower for w in WAKE_WORDS))
+    addressed = f"@{bot_username}" in text_lower
     replied_to_me = bool(msg.reply_to_message and msg.reply_to_message.from_user
                          and msg.reply_to_message.from_user.id == context.bot.id)
-    if not (addressed or replied_to_me or random.random() < CHAOS_CHANCE):
+    if not (REPLY_TO_ALL_MESSAGES or addressed or replied_to_me or random.random() < CHAOS_CHANCE):
         return
 
     # Download the largest version of the photo and base64-encode it.
